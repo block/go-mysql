@@ -1,3 +1,7 @@
+### Unreleased
+
+* Server: Allow `CLIENT_FOUND_ROWS` to be enabled via `SetCapability`, so proxies can negotiate matched-row (rather than changed-row) `UPDATE` counts. Off by default. [#1](https://github.com/block/go-mysql/pull/1) ([morgo](https://github.com/morgo))
+
 ### Tag v1.16.0 (2026-07-13)
 
 * Keep the connection open when a streamed resultset errors. [#1170](https://github.com/go-mysql-org/go-mysql/pull/1170) ([ramnes](https://github.com/ramnes))
