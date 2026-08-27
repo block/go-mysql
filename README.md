@@ -335,9 +335,10 @@ MySQL [(none)]>
 
 The flags the server advertises in its initial handshake can be adjusted with
 ```Server.SetCapability()``` and ```Server.UnsetCapability()```. Only
-`CLIENT_FOUND_ROWS`, `CLIENT_LOCAL_FILES`, `CLIENT_MULTI_RESULTS`, and
-`CLIENT_PS_MULTI_RESULTS` may be toggled; the rest are derived from how the server was
-constructed (`CLIENT_SSL`, for example, follows the TLS config).
+`CLIENT_FOUND_ROWS`, `CLIENT_LOCAL_FILES`, `CLIENT_MULTI_RESULTS`,
+`CLIENT_PS_MULTI_RESULTS`, and `CLIENT_DEPRECATE_EOF` may be toggled; the rest are
+derived from how the server was constructed (`CLIENT_SSL`, for example, follows the
+TLS config).
 
 Advertising a capability does not implement it. `CLIENT_FOUND_ROWS` decides what an
 `UPDATE`'s affected-row count means — rows *matched* with the flag, rows actually
