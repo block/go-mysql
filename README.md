@@ -331,6 +331,47 @@ MySQL [(none)]>
 >
 > To customize server configurations, use ```NewServer()``` and create connection via ```NewCustomizedConn()```.
 
+### Capabilities
+
+The flags the server advertises in its initial handshake can be adjusted with
+```Server.SetCapability()``` and ```Server.UnsetCapability()```. Only
+`CLIENT_FOUND_ROWS`, `CLIENT_LOCAL_FILES`, `CLIENT_MULTI_RESULTS`, and
+`CLIENT_PS_MULTI_RESULTS` may be toggled; the rest are derived from how the server was
+constructed (`CLIENT_SSL`, for example, follows the TLS config).
+
+Advertising a capability does not implement it. `CLIENT_FOUND_ROWS` decides what an
+`UPDATE`'s affected-row count means — rows *matched* with the flag, rows actually
+*changed* without it, so a no-op `UPDATE` reports 1 rather than 0 — and this package
+never computes affected rows, so honoring it is entirely up to your `Handler`:
+
+```go
+svr := server.NewDefaultServer()
+// Only do this if your Handler implements the semantics below.
+if err := svr.SetCapability(mysql.CLIENT_FOUND_ROWS); err != nil {
+	log.Fatal(err)
+}
+```
+
+```go
+func (h *myHandler) HandleQuery(query string) (*mysql.Result, error) {
+	// h.conn is the *server.Conn this handler was created for.
+	if h.conn.HasCapability(mysql.CLIENT_FOUND_ROWS) {
+		// Report rows matched by the UPDATE.
+	} else {
+		// Report rows actually changed by the UPDATE.
+	}
+	// ...
+}
+```
+
+The flag is off by default, and it should stay off unless your `Handler` really does
+return matched-row counts: a server that advertises it without implementing it is
+lying to its clients. Note that clients differ in whether the request even reaches
+you — Connector/J sends `CLIENT_FOUND_ROWS` unconditionally when `useAffectedRows=false`
+(its default), while go-sql-driver/mysql masks its request against the server's
+advertised set, so `clientFoundRows=true` is silently dropped unless the server
+advertises the flag.
+
 ## Driver
 
 Driver is the package that you can use go-mysql with go database/sql like other drivers. A simple example:
