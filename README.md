@@ -344,17 +344,40 @@ Advertising a capability does not implement it. `CLIENT_FOUND_ROWS` decides what
 *changed* without it, so a no-op `UPDATE` reports 1 rather than 0 — and this package
 never computes affected rows, so honoring it is entirely up to your `Handler`:
 
+The check is `(*server.Conn).HasCapability()`, which reports what the client actually
+requested. `server.Handler` carries no connection reference, so a handler that needs it
+has to be created per connection and given the `*server.Conn` itself — the constructors
+take the handler as an argument, so wire it up after the connection is returned, before
+you start serving commands:
+
 ```go
 svr := server.NewDefaultServer()
 // Only do this if your Handler implements the semantics below.
 if err := svr.SetCapability(mysql.CLIENT_FOUND_ROWS); err != nil {
 	log.Fatal(err)
 }
+
+type myHandler struct {
+	server.EmptyHandler
+	conn *server.Conn
+}
+
+h := &myHandler{}
+conn, err := svr.NewCustomizedConn(c, authHandler, h)
+if err != nil {
+	log.Fatal(err)
+}
+h.conn = conn // set before the first HandleCommand() call
+
+for {
+	if err := conn.HandleCommand(); err != nil {
+		log.Fatal(err)
+	}
+}
 ```
 
 ```go
 func (h *myHandler) HandleQuery(query string) (*mysql.Result, error) {
-	// h.conn is the *server.Conn this handler was created for.
 	if h.conn.HasCapability(mysql.CLIENT_FOUND_ROWS) {
 		// Report rows matched by the UPDATE.
 	} else {
