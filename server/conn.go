@@ -17,6 +17,7 @@ type Conn struct {
 	serverConf     *Server
 	capability     uint32
 	charset        uint8
+	collationID    uint16
 	authPluginName string
 	attributes     map[string]string
 	connectionID   uint32
@@ -180,8 +181,17 @@ func (c *Conn) deprecateEOF() bool {
 		c.serverConf.Capability()&mysql.CLIENT_DEPRECATE_EOF > 0
 }
 
+// Charset returns the low byte of the client's collation ID. The handshake
+// carries only that byte, but COM_CHANGE_USER carries all 16 bits; see
+// CollationID.
 func (c *Conn) Charset() uint8 {
 	return c.charset
+}
+
+// CollationID returns the client's collation ID: from the handshake (8 bits),
+// or from the last COM_CHANGE_USER that named one (16 bits).
+func (c *Conn) CollationID() uint16 {
+	return c.collationID
 }
 
 // Attributes returns the connection attributes.

@@ -28,7 +28,7 @@ type changeUserRequest struct {
 	user       string
 	auth       []byte
 	db         string
-	charset    uint16 // 0 when absent
+	charset    uint16 // collation ID; 0 when absent
 	plugin     string
 	attributes map[string]string // nil when absent
 }
@@ -54,11 +54,20 @@ func (c *Conn) changeUser(h ChangeUserHandler, data []byte) error {
 	// Authenticate against the scramble the connection already has, as MySQL
 	// does: the client computes its response from the handshake's (or the
 	// last auth switch's) auth data.
+	// The request's metadata is installed before authentication, as the
+	// handshake installs its attributes, so the auth hooks see it.
+	if req.charset != 0 {
+		c.charset = uint8(req.charset)
+		c.collationID = req.charset
+	}
+	if req.attributes != nil {
+		c.attributes = req.attributes
+	}
 	c.user = req.user
 	c.credential = Credential{}
 	c.cachingSha2FullAuth = false
 	c.authPluginName = req.plugin
-	cont, err := c.handleAuthMatch()
+	cont, err := c.handleAuthMatch(req.auth)
 	if err == nil && cont {
 		err = c.compareAuthData(c.authPluginName, req.auth)
 	}
@@ -71,12 +80,6 @@ func (c *Conn) changeUser(h ChangeUserHandler, data []byte) error {
 		return err
 	}
 
-	if req.charset != 0 {
-		c.charset = uint8(req.charset)
-	}
-	if req.attributes != nil {
-		c.attributes = req.attributes
-	}
 	if err := c.ResetStmts(); err != nil {
 		return err
 	}

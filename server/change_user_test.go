@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -127,9 +128,10 @@ func TestChangeUser(t *testing.T) {
 
 func TestChangeUserAuthFailureClosesConnection(t *testing.T) {
 	for name, tc := range map[string]struct{ user, password string }{
-		"wrong password": {"u1", "nope"},
-		"empty password": {"u1", ""},
-		"unknown user":   {"nobody", "x"},
+		"wrong password":               {"u1", "nope"},
+		"empty password":               {"u1", ""},
+		"unknown user":                 {"nobody", "x"},
+		"unknown user, empty password": {"nobody", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			auth := newChangeUserAuth(t)
@@ -139,6 +141,15 @@ func TestChangeUserAuthFailureClosesConnection(t *testing.T) {
 			err := c.ChangeUser(tc.user, tc.password, "db1")
 			var myErr *mysql.MyError
 			require.ErrorAs(t, err, &myErr)
+			// As MySQL: every case, an unknown user included, is 1045, and
+			// the message reports whether a password was sent.
+			require.Equal(t, uint16(mysql.ER_ACCESS_DENIED_ERROR), myErr.Code)
+			usingPassword := "YES"
+			if tc.password == "" {
+				usingPassword = "NO"
+			}
+			require.Contains(t, myErr.Message, "'"+tc.user+"'@")
+			require.Contains(t, myErr.Message, "(using password: "+usingPassword+")")
 			changes, _ := h.state()
 			require.Empty(t, changes, "the handler is not called")
 			require.Equal(t, int32(1), auth.onFailureCalled.Load())
@@ -215,4 +226,86 @@ func TestParseChangeUser(t *testing.T) {
 			require.Equal(t, uint16(mysql.ER_MALFORMED_PACKET), myErr.Code)
 		})
 	}
+}
+
+func TestHandshakeUnknownUserIsAccessDenied(t *testing.T) {
+	for password, usingPassword := range map[string]string{"x": "YES", "": "NO"} {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = NewDefaultServer().NewCustomizedConn(conn, newChangeUserAuth(t), &EmptyHandler{})
+		}()
+		_, err = client.Connect(l.Addr().String(), "nobody", password, "")
+		<-done
+		l.Close()
+		var myErr *mysql.MyError
+		require.ErrorAs(t, err, &myErr)
+		require.Equal(t, uint16(mysql.ER_ACCESS_DENIED_ERROR), myErr.Code)
+		require.Contains(t, myErr.Message, "(using password: "+usingPassword+")")
+	}
+}
+
+// metadataAuthHandler records what OnAuthSuccess sees of the connection.
+type metadataAuthHandler struct {
+	*InMemoryAuthenticationHandler
+	mu   sync.Mutex
+	seen []string
+}
+
+func (h *metadataAuthHandler) OnAuthSuccess(c *Conn) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = append(h.seen, fmt.Sprintf("%s charset=%d collation=%d attr=%s",
+		c.GetUser(), c.Charset(), c.CollationID(), c.Attributes()["k"]))
+	return nil
+}
+
+func TestChangeUserMetadataBeforeAuthHooks(t *testing.T) {
+	auth := &metadataAuthHandler{InMemoryAuthenticationHandler: NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)}
+	require.NoError(t, auth.AddUser("u1", "p1"))
+	require.NoError(t, auth.AddUser("u2", "p2"))
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+	done := make(chan struct{})
+	defer func() { <-done }()
+	go func() {
+		defer close(done)
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		co, err := NewDefaultServer().NewCustomizedConn(conn, auth, &changeUserHandler{})
+		if err != nil {
+			return
+		}
+		//nolint:revive // loop drains commands; work is in the condition
+		for co.HandleCommand() == nil {
+		}
+	}()
+
+	// utf8mb4_0900_as_cs is collation 278: the handshake carries only its
+	// low byte (22), COM_CHANGE_USER all of it.
+	c, err := client.Connect(l.Addr().String(), "u1", "p1", "", func(c *client.Conn) error {
+		c.SetAttributes(map[string]string{"k": "v1"})
+		return c.SetCollation("utf8mb4_0900_as_cs")
+	})
+	require.NoError(t, err)
+	defer c.Close()
+	c.SetAttributes(map[string]string{"k": "v2"})
+	require.NoError(t, c.ChangeUser("u2", "p2", ""))
+
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+	require.Equal(t, []string{
+		"u1 charset=22 collation=22 attr=v1",
+		"u2 charset=22 collation=278 attr=v2",
+	}, auth.seen)
 }
