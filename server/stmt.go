@@ -52,9 +52,10 @@ type Stmt struct {
 // SetMaxLongDataSize describes, with that error. ReleaseLongData returns
 // bytes when they are discarded: consumed by an execution, cleared by
 // COM_STMT_RESET, refused, or dropped with the statement by COM_STMT_CLOSE
-// or Conn.ResetStmts. Long data still retained when the connection ends is
-// not released; the handler releases what it holds when it is done with the
-// connection.
+// or Conn.ResetStmts, and everything still held when the connection is
+// closed (Conn.Close, which every teardown in HandleCommand calls). Each
+// reserved byte is released exactly once. Neither method is called with a
+// lock held, so either may call Conn.Close.
 type LongDataHandler interface {
 	ReserveLongData(n int) error
 	ReleaseLongData(n int)
@@ -78,10 +79,66 @@ func (s *Stmt) ResetParams() {
 // resetStmtParams is ResetParams, releasing the statement's long data to the
 // handler's LongDataHandler.
 func (c *Conn) resetStmtParams(s *Stmt) {
-	if h, ok := c.h.(LongDataHandler); ok && s.longDataSize > 0 {
-		h.ReleaseLongData(s.longDataSize)
-	}
+	c.releaseLongData(s.longDataSize)
 	s.ResetParams()
+}
+
+// errLongDataConnClosed refuses long data that arrives on a closed connection.
+var errLongDataConnClosed = stderrors.New("connection closed")
+
+// reserveLongData reserves n bytes through the handler's LongDataHandler and
+// counts them as held by this connection. Once the connection is closed it
+// refuses, returning anything the handler just granted.
+func (c *Conn) reserveLongData(n int) error {
+	h, ok := c.h.(LongDataHandler)
+	if !ok || n == 0 {
+		return nil
+	}
+	if err := h.ReserveLongData(n); err != nil {
+		return err
+	}
+	c.longDataMu.Lock()
+	if c.longDataReleased {
+		c.longDataMu.Unlock()
+		h.ReleaseLongData(n)
+		return errLongDataConnClosed
+	}
+	c.longDataHeld += n
+	c.longDataMu.Unlock()
+	return nil
+}
+
+// releaseLongData returns n held bytes to the handler, unless Close already
+// returned everything.
+func (c *Conn) releaseLongData(n int) {
+	h, ok := c.h.(LongDataHandler)
+	if !ok || n == 0 {
+		return
+	}
+	c.longDataMu.Lock()
+	if c.longDataReleased {
+		c.longDataMu.Unlock()
+		return
+	}
+	c.longDataHeld -= n
+	c.longDataMu.Unlock()
+	h.ReleaseLongData(n)
+}
+
+// releaseAllLongData returns everything the connection holds, once.
+func (c *Conn) releaseAllLongData() {
+	c.longDataMu.Lock()
+	if c.longDataReleased {
+		c.longDataMu.Unlock()
+		return
+	}
+	c.longDataReleased = true
+	n := c.longDataHeld
+	c.longDataHeld = 0
+	c.longDataMu.Unlock()
+	if h, ok := c.h.(LongDataHandler); ok && n > 0 {
+		h.ReleaseLongData(n)
+	}
 }
 
 // maxLongDataSize is the per-parameter long data bound.
@@ -454,11 +511,9 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 		c.failLongData(s, errLongDataTooLong())
 		return nil
 	}
-	if h, ok := c.h.(LongDataHandler); ok {
-		if err := h.ReserveLongData(len(chunk)); err != nil {
-			c.failLongData(s, err)
-			return nil
-		}
+	if err := c.reserveLongData(len(chunk)); err != nil {
+		c.failLongData(s, err)
+		return nil
 	}
 	// append copies defensively: the value outlives this packet, which
 	// belongs to the caller. A non-nil empty slice still marks the parameter
