@@ -18,8 +18,11 @@ var (
 	ErrAccessDeniedNoPassword = fmt.Errorf("%w without password", ErrAccessDenied)
 
 	// An account the AuthenticationHandler does not know is denied like a
-	// wrong password, with MySQL's ER_ACCESS_DENIED_ERROR, so a client cannot
-	// tell which accounts exist.
+	// wrong password, with MySQL's ER_ACCESS_DENIED_ERROR, so the error code
+	// does not reveal whether the account exists. The auth exchange still
+	// can: an unknown account is denied straight away, while a known one may
+	// first get an auth switch or a full-auth request. MySQL 8 avoids that
+	// with a decoy exchange; this server does not.
 	errUnknownUser           = fmt.Errorf("%w: unknown user", ErrAccessDenied)
 	errUnknownUserNoPassword = fmt.Errorf("%w: unknown user", ErrAccessDeniedNoPassword)
 )

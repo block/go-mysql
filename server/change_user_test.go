@@ -309,3 +309,18 @@ func TestChangeUserMetadataBeforeAuthHooks(t *testing.T) {
 		"u2 charset=22 collation=278 attr=v2",
 	}, auth.seen)
 }
+
+// Without CLIENT_PLUGIN_AUTH the request carries no plugin name, so the bytes
+// after the collation are the connection attributes.
+func TestParseChangeUserWithoutPluginAuth(t *testing.T) {
+	c := &Conn{capability: mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_SECURE_CONNECTION |
+		mysql.CLIENT_CONNECT_ATTRS}
+	data := []byte("u\x00\x02ab" + "db\x00" + "\xff\x00")
+	data = append(data, 0x06, 0x01, 'k', 0x03, 'v', 'a', 'l')
+	req, err := c.parseChangeUser(data)
+	require.NoError(t, err)
+	require.Equal(t, &changeUserRequest{
+		user: "u", auth: []byte("ab"), db: "db", charset: 255,
+		plugin: mysql.AUTH_NATIVE_PASSWORD, attributes: map[string]string{"k": "val"},
+	}, req)
+}
