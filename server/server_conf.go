@@ -45,7 +45,7 @@ type Server struct {
 	tlsConfig         *tls.Config
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
-	maxLongDataSize   int
+	maxLongDataSize   int64 // read and written atomically
 }
 
 // DefaultMaxLongDataSize is the default bound on one prepared-statement
@@ -148,18 +148,19 @@ func isAuthMethodSupported(authMethod string) bool {
 // the statement in an error state, as in MySQL: its long data is discarded,
 // later chunks are ignored, and every COM_STMT_EXECUTE fails with
 // ER_UNKNOWN_ERROR until COM_STMT_RESET. n <= 0 restores
-// DefaultMaxLongDataSize.
+// DefaultMaxLongDataSize. It is safe to call while serving: a new bound
+// applies to the chunks that arrive after it.
 func (s *Server) SetMaxLongDataSize(n int) {
 	if n <= 0 {
 		n = DefaultMaxLongDataSize
 	}
-	s.maxLongDataSize = n
+	atomic.StoreInt64(&s.maxLongDataSize, int64(n))
 }
 
 // MaxLongDataSize returns the per-parameter long data bound (see
 // SetMaxLongDataSize).
 func (s *Server) MaxLongDataSize() int {
-	return s.maxLongDataSize
+	return int(atomic.LoadInt64(&s.maxLongDataSize))
 }
 
 func (s *Server) InvalidateCache(username string, host string) {

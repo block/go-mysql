@@ -440,6 +440,19 @@ func TestResetStmtsReportsCloseErrors(t *testing.T) {
 	require.Empty(t, c.stmts, "statements are deallocated even when a close fails")
 }
 
+func TestStmtCloseDeallocatesWhenTheHandlerFails(t *testing.T) {
+	closeErr := stderrors.New("close failed")
+	h := &accountingStmtHandler{recordingStmtHandler: recordingStmtHandler{params: 1, closeErr: closeErr}, limit: 6}
+	c := newStmtTestConn(h)
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+	c.dispatch(longDataPacket(0, "abc"))
+	require.Equal(t, 3, h.reserved)
+
+	require.ErrorIs(t, c.handleStmtClose([]byte{1, 0, 0, 0}), closeErr)
+	require.Empty(t, c.stmts, "the statement is deallocated even when its close fails")
+	require.Equal(t, 0, h.reserved, "its long data is released")
+}
+
 // longDataPacket is a COM_STMT_SEND_LONG_DATA for statement 1.
 func longDataPacket(param byte, chunk string) []byte {
 	return append([]byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, param, 0}, chunk...)
@@ -498,6 +511,26 @@ func TestSetMaxLongDataSize(t *testing.T) {
 	require.Equal(t, DefaultMaxLongDataSize, s.MaxLongDataSize())
 	// A connection without a server configuration has the default bound.
 	require.Equal(t, DefaultMaxLongDataSize, newStmtTestConn(&recordingStmtHandler{}).maxLongDataSize())
+}
+
+// TestSetMaxLongDataSizeWhileServing changes the bound while a connection
+// reads it; run with -race.
+func TestSetMaxLongDataSizeWhileServing(t *testing.T) {
+	s := &Server{}
+	c := newStmtTestConn(&recordingStmtHandler{})
+	c.serverConf = s
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 1; i <= 1000; i++ {
+			s.SetMaxLongDataSize(i)
+		}
+	}()
+	for range 1000 {
+		require.Positive(t, c.maxLongDataSize())
+	}
+	<-done
+	require.Equal(t, 1000, c.maxLongDataSize())
 }
 
 // accountingStmtHandler records long data reservations and refuses those

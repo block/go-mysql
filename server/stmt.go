@@ -86,10 +86,10 @@ func (c *Conn) resetStmtParams(s *Stmt) {
 
 // maxLongDataSize is the per-parameter long data bound.
 func (c *Conn) maxLongDataSize() int {
-	if c.serverConf == nil || c.serverConf.maxLongDataSize <= 0 {
+	if c.serverConf == nil || c.serverConf.MaxLongDataSize() <= 0 {
 		return DefaultMaxLongDataSize
 	}
-	return c.serverConf.maxLongDataSize
+	return c.serverConf.MaxLongDataSize()
 }
 
 // errLongDataTooLong is MySQL's answer to long data past max_allowed_packet.
@@ -510,14 +510,14 @@ func (c *Conn) handleStmtClose(data []byte) error {
 		return nil
 	}
 
-	if err := c.h.HandleStmtClose(stmt.Context); err != nil {
-		return err
-	}
-
+	// The client has no reply to wait for and will not use the statement
+	// again, so it is deallocated whatever the handler returns, as
+	// ResetStmts does.
+	err := c.h.HandleStmtClose(stmt.Context)
 	c.resetStmtParams(stmt)
 	delete(c.stmts, id)
 
-	return nil
+	return err
 }
 
 // ResetStmts deallocates every prepared statement on the connection, calling
