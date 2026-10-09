@@ -1,6 +1,7 @@
 package server
 
 import (
+	stderrors "errors"
 	"slices"
 	"testing"
 
@@ -156,11 +157,12 @@ func TestBindStmtArgsTypedBytes(t *testing.T) {
 // contexts passed to HandleStmtClose.
 type recordingStmtHandler struct {
 	EmptyHandler
-	params  int
-	args    [][]any
-	err     error
-	closed  []any
-	nextCtx int
+	params   int
+	args     [][]any
+	err      error
+	closeErr error
+	closed   []any
+	nextCtx  int
 }
 
 func (h *recordingStmtHandler) HandleStmtPrepare(query string) (int, int, any, error) {
@@ -175,7 +177,7 @@ func (h *recordingStmtHandler) HandleStmtExecute(context any, query string, args
 
 func (h *recordingStmtHandler) HandleStmtClose(context any) error {
 	h.closed = append(h.closed, context)
-	return nil
+	return h.closeErr
 }
 
 func newStmtTestConn(h Handler) *Conn {
@@ -202,8 +204,11 @@ func TestStmtExecuteReusesBoundTypes(t *testing.T) {
 	require.IsType(t, &Stmt{}, c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?, ?"...)))
 
 	types := []byte{mysql.MYSQL_TYPE_LONG, 0, mysql.MYSQL_TYPE_VAR_STRING, 0}
-	_, err := c.handleStmtExecute(executePacket([]byte{0}, types, []byte{7, 0, 0, 0, 2, 'a', 'b'}))
+	pkt := executePacket([]byte{0}, types, []byte{7, 0, 0, 0, 2, 'a', 'b'})
+	_, err := c.handleStmtExecute(pkt)
 	require.NoError(t, err)
+	// The server keeps the types, not the packet holding them.
+	pkt[11] = mysql.MYSQL_TYPE_TINY
 
 	// Flag 0: the types are not resent, the values are.
 	_, err = c.handleStmtExecute(executePacket([]byte{0}, nil, []byte{8, 0, 0, 0, 1, 'c'}))
@@ -270,11 +275,10 @@ func TestStmtExecuteLongData(t *testing.T) {
 	c := newStmtTestConn(h)
 	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "INSERT INTO t VALUES (?, ?)"...))
 
-	chunk := []byte{1, 0, 0, 0, 0, 0, 'x', 'y'}
-	require.Equal(t, noResponse{}, c.dispatch(append([]byte{mysql.COM_STMT_SEND_LONG_DATA}, chunk...)))
-	// The packet buffer is reused by the next read; the server must have
-	// copied it.
-	chunk[6] = 'Z'
+	pkt := []byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, 0, 0, 'x', 'y'}
+	require.Equal(t, noResponse{}, c.dispatch(pkt))
+	// The server keeps the value, not the packet holding it.
+	pkt[7] = 'Z'
 	c.dispatch(append([]byte{mysql.COM_STMT_SEND_LONG_DATA}, 1, 0, 0, 0, 0, 0, 'z'))
 
 	// Parameter 0 has long data, so only parameter 1's value is in the
@@ -322,4 +326,116 @@ func TestResetStmts(t *testing.T) {
 
 	_, err := c.handleStmtExecute([]byte{1, 0, 0, 0, 0, 1, 0, 0, 0})
 	require.ErrorContains(t, err, "Unknown prepared statement handler (1)")
+}
+
+func TestStmtSendLongDataEmptyChunk(t *testing.T) {
+	h := &recordingStmtHandler{params: 2}
+	c := newStmtTestConn(h)
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "INSERT INTO t VALUES (?, ?)"...))
+
+	// An empty chunk still marks parameter 0 as sent through long data, so
+	// the packet holds only parameter 1's value.
+	c.dispatch([]byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, 0, 0})
+	types := []byte{mysql.MYSQL_TYPE_BLOB, 0, mysql.MYSQL_TYPE_TINY, 0}
+	_, err := c.handleStmtExecute(executePacket([]byte{0}, types, []byte{5}))
+	require.NoError(t, err)
+	require.Equal(t, [][]any{{mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte{}}, int8(5)}}, h.args)
+}
+
+func TestStmtExecuteLongDataRequiresStringType(t *testing.T) {
+	// MySQL 8.0 accepts long data only for the string and blob types and
+	// answers ER_MALFORMED_PACKET for any other declared type.
+	for _, tp := range []byte{
+		mysql.MYSQL_TYPE_TINY_BLOB, mysql.MYSQL_TYPE_MEDIUM_BLOB, mysql.MYSQL_TYPE_LONG_BLOB,
+		mysql.MYSQL_TYPE_BLOB, mysql.MYSQL_TYPE_VAR_STRING, mysql.MYSQL_TYPE_STRING,
+	} {
+		h := &recordingStmtHandler{params: 1}
+		c := newStmtTestConn(h)
+		c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+		c.dispatch([]byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, 0, 0, '4', '2'})
+		_, err := c.handleStmtExecute(executePacket([]byte{0}, []byte{tp, 0}, nil))
+		require.NoError(t, err, "type %d", tp)
+		require.Equal(t, [][]any{{mysql.TypedBytes{Type: tp, Bytes: []byte("42")}}}, h.args)
+	}
+
+	for _, tp := range []byte{
+		mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_LONGLONG, mysql.MYSQL_TYPE_DATETIME,
+		mysql.MYSQL_TYPE_VARCHAR, mysql.MYSQL_TYPE_JSON, mysql.MYSQL_TYPE_NEWDECIMAL,
+		mysql.MYSQL_TYPE_ENUM, mysql.MYSQL_TYPE_GEOMETRY,
+	} {
+		h := &recordingStmtHandler{params: 2}
+		c := newStmtTestConn(h)
+		c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?, ?"...))
+		c.dispatch([]byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, 0, 0, '4', '2'})
+		types := []byte{tp, 0, mysql.MYSQL_TYPE_TINY, 0}
+		_, err := c.handleStmtExecute(executePacket([]byte{0}, types, []byte{5}))
+		var myErr *mysql.MyError
+		require.ErrorAs(t, err, &myErr, "type %d", tp)
+		require.Equal(t, uint16(mysql.ER_MALFORMED_PACKET), myErr.Code, "type %d", tp)
+		require.Empty(t, h.args)
+	}
+}
+
+func TestStmtMalformedPacketCodes(t *testing.T) {
+	h := &recordingStmtHandler{params: 1}
+	c := newStmtTestConn(h)
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+	long := []byte{mysql.MYSQL_TYPE_LONG, 0}
+	str := []byte{mysql.MYSQL_TYPE_VAR_STRING, 0}
+
+	// Codes measured against MySQL 8.0.44.
+	for _, tc := range []struct {
+		name string
+		run  func() error
+		code uint16
+	}{
+		{"execute without parameters block", func() error {
+			_, err := c.handleStmtExecute([]byte{1, 0, 0, 0, 0})
+			return err
+		}, mysql.ER_MALFORMED_PACKET},
+		{"execute without null bitmap", func() error {
+			_, err := c.handleStmtExecute(executePacket(nil, nil, nil)[:9])
+			return err
+		}, mysql.ER_MALFORMED_PACKET},
+		{"truncated types", func() error {
+			_, err := c.handleStmtExecute(executePacket([]byte{0}, long[:1], nil))
+			return err
+		}, mysql.ER_MALFORMED_PACKET},
+		{"truncated fixed-width value", func() error {
+			_, err := c.handleStmtExecute(executePacket([]byte{0}, long, []byte{1, 2}))
+			return err
+		}, mysql.ER_MALFORMED_PACKET},
+		{"truncated length-encoded value", func() error {
+			_, err := c.handleStmtExecute(executePacket([]byte{0}, str, []byte{5, 'a'}))
+			return err
+		}, mysql.ER_MALFORMED_PACKET},
+		{"unknown type", func() error {
+			_, err := c.handleStmtExecute(executePacket([]byte{0}, []byte{0x14, 0}, []byte{1, 'a'}))
+			return err
+		}, mysql.ER_WRONG_ARGUMENTS},
+		{"short reset", func() error {
+			_, err := c.handleStmtReset([]byte{1, 0})
+			return err
+		}, mysql.ER_MALFORMED_PACKET},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var myErr *mysql.MyError
+			require.ErrorAs(t, tc.run(), &myErr)
+			require.Equal(t, tc.code, myErr.Code)
+		})
+	}
+	require.Empty(t, h.args)
+}
+
+func TestResetStmtsReportsCloseErrors(t *testing.T) {
+	closeErr := stderrors.New("close failed")
+	h := &recordingStmtHandler{closeErr: closeErr}
+	c := newStmtTestConn(h)
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT 1"...))
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT 2"...))
+
+	err := c.ResetStmts()
+	require.ErrorIs(t, err, closeErr)
+	require.ElementsMatch(t, []any{1, 2}, h.closed)
+	require.Empty(t, c.stmts, "statements are deallocated even when a close fails")
 }
