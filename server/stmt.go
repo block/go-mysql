@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -24,6 +25,17 @@ type Stmt struct {
 
 	// PreparedStmt contains common fields shared with client.Stmt for proxy passthrough
 	stmt.PreparedStmt
+
+	// paramTypes holds the type-and-flag pairs (2 bytes per parameter) the
+	// client last bound. A COM_STMT_EXECUTE whose new-params-bound flag is 0
+	// still sends parameter values, encoded with these types; libmysqlclient
+	// and Connector/J do this on every execution after the first.
+	paramTypes []byte
+	// longData holds the bytes accumulated by COM_STMT_SEND_LONG_DATA per
+	// parameter. A parameter with long data has no value in the
+	// COM_STMT_EXECUTE packet. Cleared after every execution and by
+	// COM_STMT_RESET.
+	longData [][]byte
 }
 
 func (s *Stmt) Rest(params int, columns int, context any) {
@@ -35,6 +47,7 @@ func (s *Stmt) Rest(params int, columns int, context any) {
 
 func (s *Stmt) ResetParams() {
 	s.Args = make([]any, s.Params)
+	s.longData = nil
 }
 
 func (c *Conn) writePrepare(s *Stmt) error {
@@ -107,7 +120,7 @@ func (c *Conn) writePrepare(s *Stmt) error {
 
 func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	if len(data) < 9 {
-		return nil, mysql.ErrMalformPacket
+		return nil, errMalformedPacket()
 	}
 
 	pos := 0
@@ -119,6 +132,11 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 		return nil, mysql.NewDefaultError(mysql.ER_UNKNOWN_STMT_HANDLER, 5,
 			strconv.FormatUint(uint64(id), 10), "stmt_execute")
 	}
+
+	// Long data and bound values are consumed by this execution whatever its
+	// outcome, including a rejected flag, as in MySQL; the bound types
+	// persist.
+	defer s.ResetParams()
 
 	flag := data[pos]
 	pos++
@@ -145,35 +163,33 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	// skip iteration-count, always 1
 	pos += 4
 
-	var nullBitmaps []byte
-	var paramTypes []byte
-	var paramValues []byte
-
 	paramNum := s.Params
 
 	if paramNum > 0 {
 		nullBitmapLen := (s.Params + 7) >> 3
 		if len(data) < (pos + nullBitmapLen + 1) {
-			return nil, mysql.ErrMalformPacket
+			return nil, errMalformedPacket()
 		}
-		nullBitmaps = data[pos : pos+nullBitmapLen]
+		nullBitmaps := data[pos : pos+nullBitmapLen]
 		pos += nullBitmapLen
 
-		// new param bound flag
-		if data[pos] == 1 {
-			pos++
+		// new-params-bound flag: when 1 the parameter types follow; when 0
+		// the client reuses the types it bound last. Parameter values follow
+		// either way.
+		newParamsBound := data[pos]
+		pos++
+		if newParamsBound == 1 {
 			if len(data) < (pos + (paramNum << 1)) {
-				return nil, mysql.ErrMalformPacket
+				return nil, errMalformedPacket()
 			}
-
-			paramTypes = data[pos : pos+(paramNum<<1)]
+			// Copied defensively: the types outlive this packet, which belongs
+			// to the caller.
+			s.paramTypes = append(s.paramTypes[:0], data[pos:pos+(paramNum<<1)]...)
 			pos += paramNum << 1
+		}
 
-			paramValues = data[pos:]
-
-			if err := c.bindStmtArgs(s, nullBitmaps, paramTypes, paramValues); err != nil {
-				return nil, errors.Trace(err)
-			}
+		if err := c.bindStmtArgs(s, nullBitmaps, s.paramTypes, data[pos:]); err != nil {
+			return nil, errors.Trace(err)
 		}
 	}
 
@@ -182,8 +198,6 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	if r, err = c.h.HandleStmtExecute(s.Context, s.Query, s.Args); err != nil {
 		return nil, errors.Trace(err)
 	}
-
-	s.ResetParams()
 
 	return r, nil
 }
@@ -195,8 +209,10 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 	// 0xfe80 == Type 0xfe and Flag 0x80
 	// The flag only has one bit and that indicates if it is unsigned or not.
 	// Types are 1 byte, but might grow into the 7 unused bits in the future.
-	if len(paramTypes)/2 != s.Params {
-		return mysql.ErrMalformPacket
+	// paramTypes is nil when the client has never bound types; that is only
+	// valid while every parameter is NULL, as in MySQL.
+	if paramTypes != nil && len(paramTypes)/2 != s.Params {
+		return errMalformedPacket()
 	}
 
 	pos := 0
@@ -207,11 +223,27 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 	var err error
 
 	for i := 0; i < s.Params; i++ {
+		// A parameter whose value arrived through COM_STMT_SEND_LONG_DATA has
+		// no value in this packet, and its NULL bit is ignored, as in MySQL.
+		if i < len(s.longData) && s.longData[i] != nil {
+			// MySQL: ER_MALFORMED_PACKET when the value's type is unknowable,
+			// or is not a string or blob type.
+			if paramTypes == nil || !isLongDataType(paramTypes[i<<1]) {
+				return errMalformedPacket()
+			}
+			args[i] = mysql.TypedBytes{Type: paramTypes[i<<1], Bytes: s.longData[i]}
+			continue
+		}
+
 		if nullBitmap[i>>3]&(1<<(uint(i)%8)) > 0 {
 			args[i] = nil
 			continue
 		}
 
+		if paramTypes == nil {
+			// MySQL: ER_WRONG_ARGUMENTS, a value with no type to decode it by.
+			return mysql.NewDefaultError(mysql.ER_WRONG_ARGUMENTS, "mysqld_stmt_execute")
+		}
 		tp := paramTypes[i<<1]
 		isUnsigned := (paramTypes[(i<<1)+1] & mysql.PARAM_UNSIGNED) > 0
 
@@ -222,7 +254,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 		case mysql.MYSQL_TYPE_TINY:
 			if len(paramValues) < (pos + 1) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			if isUnsigned {
@@ -236,7 +268,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 		case mysql.MYSQL_TYPE_SHORT, mysql.MYSQL_TYPE_YEAR:
 			if len(paramValues) < (pos + 2) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			if isUnsigned {
@@ -249,7 +281,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 		case mysql.MYSQL_TYPE_INT24, mysql.MYSQL_TYPE_LONG:
 			if len(paramValues) < (pos + 4) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			if isUnsigned {
@@ -262,7 +294,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 		case mysql.MYSQL_TYPE_LONGLONG:
 			if len(paramValues) < (pos + 8) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			if isUnsigned {
@@ -275,7 +307,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 		case mysql.MYSQL_TYPE_FLOAT:
 			if len(paramValues) < (pos + 4) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			args[i] = math.Float32frombits(binary.LittleEndian.Uint32(paramValues[pos : pos+4]))
@@ -284,7 +316,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 		case mysql.MYSQL_TYPE_DOUBLE:
 			if len(paramValues) < (pos + 8) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			args[i] = math.Float64frombits(binary.LittleEndian.Uint64(paramValues[pos : pos+8]))
@@ -298,13 +330,13 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 			mysql.MYSQL_TYPE_DATE, mysql.MYSQL_TYPE_NEWDATE,
 			mysql.MYSQL_TYPE_TIMESTAMP, mysql.MYSQL_TYPE_DATETIME, mysql.MYSQL_TYPE_TIME:
 			if len(paramValues) < (pos + 1) {
-				return mysql.ErrMalformPacket
+				return errMalformedPacket()
 			}
 
 			v, isNull, n, err = mysql.LengthEncodedString(paramValues[pos:])
 			pos += n
 			if err != nil {
-				return errors.Trace(err)
+				return errMalformedPacket()
 			}
 
 			if !isNull {
@@ -314,10 +346,28 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 			args[i] = nil
 			continue
 		default:
-			return errors.Errorf("Stmt Unknown FieldType %d", tp)
+			// MySQL: ER_WRONG_ARGUMENTS for a type it does not know.
+			return mysql.NewDefaultError(mysql.ER_WRONG_ARGUMENTS, "mysqld_stmt_execute")
 		}
 	}
 	return nil
+}
+
+// errMalformedPacket is MySQL's ER_MALFORMED_PACKET (1835).
+// mysql.ErrMalformPacket is a plain error and would reach the client as 1105.
+func errMalformedPacket() error {
+	return mysql.NewDefaultError(mysql.ER_MALFORMED_PACKET)
+}
+
+// isLongDataType reports whether MySQL accepts COM_STMT_SEND_LONG_DATA for a
+// parameter of type tp: only the string and blob types.
+func isLongDataType(tp byte) bool {
+	switch tp {
+	case mysql.MYSQL_TYPE_TINY_BLOB, mysql.MYSQL_TYPE_MEDIUM_BLOB, mysql.MYSQL_TYPE_LONG_BLOB,
+		mysql.MYSQL_TYPE_BLOB, mysql.MYSQL_TYPE_VAR_STRING, mysql.MYSQL_TYPE_STRING:
+		return true
+	}
+	return false
 }
 
 // stmt send long data command has no response
@@ -338,23 +388,23 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 		return nil
 	}
 
-	if s.Args[paramID] == nil {
-		s.Args[paramID] = data[6:]
-	} else {
-		if b, ok := s.Args[paramID].([]byte); ok {
-			b = append(b, data[6:]...)
-			s.Args[paramID] = b
-		} else {
-			return nil
-		}
+	if s.longData == nil {
+		s.longData = make([][]byte, s.Params)
 	}
+	// append copies defensively: the value outlives this packet, which
+	// belongs to the caller. A non-nil empty slice still marks the parameter
+	// as sent through long data.
+	if s.longData[paramID] == nil {
+		s.longData[paramID] = make([]byte, 0, len(data)-6)
+	}
+	s.longData[paramID] = append(s.longData[paramID], data[6:]...)
 
 	return nil
 }
 
 func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
 	if len(data) < 4 {
-		return nil, mysql.ErrMalformPacket
+		return nil, errMalformedPacket()
 	}
 
 	id := binary.LittleEndian.Uint32(data[0:4])
@@ -390,4 +440,21 @@ func (c *Conn) handleStmtClose(data []byte) error {
 	delete(c.stmts, id)
 
 	return nil
+}
+
+// ResetStmts deallocates every prepared statement on the connection, calling
+// HandleStmtClose for each, as MySQL does on COM_RESET_CONNECTION and
+// COM_CHANGE_USER. A handler that implements COM_RESET_CONNECTION through
+// HandleOtherCommand calls it so that statement IDs the client no longer
+// holds stop resolving. Every statement is removed even if HandleStmtClose
+// fails; the errors are joined.
+func (c *Conn) ResetStmts() error {
+	var errs []error
+	for id, st := range c.stmts {
+		if err := c.h.HandleStmtClose(st.Context); err != nil {
+			errs = append(errs, err)
+		}
+		delete(c.stmts, id)
+	}
+	return stderrors.Join(errs...)
 }
