@@ -133,6 +133,11 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 			strconv.FormatUint(uint64(id), 10), "stmt_execute")
 	}
 
+	// Long data and bound values are consumed by this execution whatever its
+	// outcome, including a rejected flag, as in MySQL; the bound types
+	// persist.
+	defer s.ResetParams()
+
 	flag := data[pos]
 	pos++
 	// Supported types:
@@ -157,10 +162,6 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 
 	// skip iteration-count, always 1
 	pos += 4
-
-	// Long data and bound values are consumed by this execution whatever its
-	// outcome, as in MySQL; the bound types persist.
-	defer s.ResetParams()
 
 	paramNum := s.Params
 
@@ -208,7 +209,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 	// The flag only has one bit and that indicates if it is unsigned or not.
 	// Types are 1 byte, but might grow into the 7 unused bits in the future.
 	// paramTypes is nil when the client has never bound types; that is only
-	// valid while every parameter is NULL or has long data.
+	// valid while every parameter is NULL, as in MySQL.
 	if paramTypes != nil && len(paramTypes)/2 != s.Params {
 		return mysql.ErrMalformPacket
 	}
@@ -224,11 +225,11 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 		// A parameter whose value arrived through COM_STMT_SEND_LONG_DATA has
 		// no value in this packet, and its NULL bit is ignored, as in MySQL.
 		if i < len(s.longData) && s.longData[i] != nil {
-			tp := mysql.MYSQL_TYPE_LONG_BLOB
-			if paramTypes != nil {
-				tp = paramTypes[i<<1]
+			if paramTypes == nil {
+				// MySQL: ER_MALFORMED_PACKET, the value's type is unknowable.
+				return mysql.NewDefaultError(mysql.ER_MALFORMED_PACKET)
 			}
-			args[i] = mysql.TypedBytes{Type: tp, Bytes: s.longData[i]}
+			args[i] = mysql.TypedBytes{Type: paramTypes[i<<1], Bytes: s.longData[i]}
 			continue
 		}
 
@@ -238,7 +239,8 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 		}
 
 		if paramTypes == nil {
-			return mysql.ErrMalformPacket
+			// MySQL: ER_WRONG_ARGUMENTS, a value with no type to decode it by.
+			return mysql.NewDefaultError(mysql.ER_WRONG_ARGUMENTS, "mysqld_stmt_execute")
 		}
 		tp := paramTypes[i<<1]
 		isUnsigned := (paramTypes[(i<<1)+1] & mysql.PARAM_UNSIGNED) > 0

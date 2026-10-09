@@ -231,9 +231,38 @@ func TestStmtExecuteWithoutBoundTypes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, [][]any{{nil}}, h.args)
 
-	// A value with no type ever bound cannot be decoded.
+	// A value with no type ever bound cannot be decoded: MySQL answers
+	// ER_WRONG_ARGUMENTS for an inline value and ER_MALFORMED_PACKET for long
+	// data.
 	_, err = c.handleStmtExecute(executePacket([]byte{0}, nil, []byte{1}))
-	require.ErrorIs(t, err, mysql.ErrMalformPacket)
+	var myErr *mysql.MyError
+	require.ErrorAs(t, err, &myErr)
+	require.Equal(t, uint16(mysql.ER_WRONG_ARGUMENTS), myErr.Code)
+
+	c.dispatch(append([]byte{mysql.COM_STMT_SEND_LONG_DATA}, 1, 0, 0, 0, 0, 0, 'x'))
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, nil, nil))
+	require.ErrorAs(t, err, &myErr)
+	require.Equal(t, uint16(mysql.ER_MALFORMED_PACKET), myErr.Code)
+	require.Equal(t, [][]any{{nil}}, h.args, "no execution reaches the handler without types")
+}
+
+func TestStmtExecuteRejectedFlagConsumesLongData(t *testing.T) {
+	h := &recordingStmtHandler{params: 1}
+	c := newStmtTestConn(h)
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+
+	c.dispatch(append([]byte{mysql.COM_STMT_SEND_LONG_DATA}, 1, 0, 0, 0, 0, 0, 'x'))
+	types := []byte{mysql.MYSQL_TYPE_VAR_STRING, 0}
+	pkt := executePacket([]byte{0}, types, nil)
+	pkt[4] = mysql.CURSOR_TYPE_READ_ONLY
+	_, err := c.handleStmtExecute(pkt)
+	require.Error(t, err)
+
+	// The rejected execution consumed the long data, so this one binds its
+	// own inline value.
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, []byte{1, 'y'}))
+	require.NoError(t, err)
+	require.Equal(t, [][]any{{mysql.TypedBytes{Type: mysql.MYSQL_TYPE_VAR_STRING, Bytes: []byte("y")}}}, h.args)
 }
 
 func TestStmtExecuteLongData(t *testing.T) {
