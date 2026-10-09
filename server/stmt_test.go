@@ -439,3 +439,132 @@ func TestResetStmtsReportsCloseErrors(t *testing.T) {
 	require.ElementsMatch(t, []any{1, 2}, h.closed)
 	require.Empty(t, c.stmts, "statements are deallocated even when a close fails")
 }
+
+// longDataPacket is a COM_STMT_SEND_LONG_DATA for statement 1.
+func longDataPacket(param byte, chunk string) []byte {
+	return append([]byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, param, 0}, chunk...)
+}
+
+func TestStmtLongDataLimit(t *testing.T) {
+	h := &recordingStmtHandler{params: 2}
+	c := newStmtTestConn(h)
+	c.serverConf = &Server{maxLongDataSize: 4}
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "INSERT INTO t VALUES (?, ?)"...))
+	types := []byte{mysql.MYSQL_TYPE_BLOB, 0, mysql.MYSQL_TYPE_BLOB, 0}
+
+	// The bound is per parameter and inclusive: 4 bytes in each is accepted.
+	c.dispatch(longDataPacket(0, "ab"))
+	c.dispatch(longDataPacket(0, "cd"))
+	c.dispatch(longDataPacket(1, "efgh"))
+	_, err := c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+	require.NoError(t, err)
+
+	// One byte past it puts the statement in the error state.
+	c.dispatch(longDataPacket(0, "abc"))
+	c.dispatch(longDataPacket(0, "de"))
+	tooLong := "Parameter of prepared statement which is set through mysql_send_long_data() is longer than 'max_allowed_packet' bytes"
+	for range 2 {
+		_, err = c.handleStmtExecute(executePacket([]byte{0}, types, []byte{1, 'x', 1, 'y'}))
+		var myErr *mysql.MyError
+		require.ErrorAs(t, err, &myErr)
+		require.Equal(t, uint16(mysql.ER_UNKNOWN_ERROR), myErr.Code)
+		require.Equal(t, "HY000", myErr.State)
+		require.Equal(t, tooLong, myErr.Message)
+	}
+	// Long data is ignored in the error state, and the refused bytes are
+	// not kept.
+	c.dispatch(longDataPacket(1, "z"))
+	require.Nil(t, c.stmts[1].longData)
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+	require.ErrorContains(t, err, tooLong)
+
+	// COM_STMT_RESET clears it.
+	_, err = c.handleStmtReset([]byte{1, 0, 0, 0})
+	require.NoError(t, err)
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, []byte{1, 'x', 1, 'y'}))
+	require.NoError(t, err)
+
+	require.Equal(t, [][]any{
+		{mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("abcd")}, mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("efgh")}},
+		{mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("x")}, mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("y")}},
+	}, h.args)
+}
+
+func TestSetMaxLongDataSize(t *testing.T) {
+	s := &Server{}
+	s.SetMaxLongDataSize(10)
+	require.Equal(t, 10, s.MaxLongDataSize())
+	s.SetMaxLongDataSize(0)
+	require.Equal(t, DefaultMaxLongDataSize, s.MaxLongDataSize())
+	// A connection without a server configuration has the default bound.
+	require.Equal(t, DefaultMaxLongDataSize, newStmtTestConn(&recordingStmtHandler{}).maxLongDataSize())
+}
+
+// accountingStmtHandler records long data reservations and refuses those
+// that would take the total past limit.
+type accountingStmtHandler struct {
+	recordingStmtHandler
+	limit    int
+	reserved int
+}
+
+func (h *accountingStmtHandler) ReserveLongData(n int) error {
+	if h.reserved+n > h.limit {
+		return mysql.NewDefaultError(mysql.ER_OUT_OF_RESOURCES)
+	}
+	h.reserved += n
+	return nil
+}
+
+func (h *accountingStmtHandler) ReleaseLongData(n int) {
+	h.reserved -= n
+}
+
+func TestStmtLongDataHandler(t *testing.T) {
+	h := &accountingStmtHandler{recordingStmtHandler: recordingStmtHandler{params: 1}, limit: 6}
+	c := newStmtTestConn(h)
+	prepare := func() {
+		c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+	}
+	types := []byte{mysql.MYSQL_TYPE_BLOB, 0}
+	prepare()
+
+	// Consumed by an execution.
+	for _, chunk := range []string{"abc", "a"} {
+		c.dispatch(longDataPacket(0, chunk))
+		require.Equal(t, len(chunk), h.reserved)
+		_, err := c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+		require.NoError(t, err)
+		require.Equal(t, 0, h.reserved)
+	}
+
+	// Cleared by COM_STMT_RESET.
+	c.dispatch(longDataPacket(0, "abc"))
+	_, err := c.handleStmtReset([]byte{1, 0, 0, 0})
+	require.NoError(t, err)
+	require.Equal(t, 0, h.reserved)
+
+	// Refused: the handler's error is the statement's error state, and what
+	// was reserved before is released.
+	c.dispatch(longDataPacket(0, "abcd"))
+	c.dispatch(longDataPacket(0, "efg"))
+	require.Equal(t, 0, h.reserved)
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+	var myErr *mysql.MyError
+	require.ErrorAs(t, err, &myErr)
+	require.Equal(t, uint16(mysql.ER_OUT_OF_RESOURCES), myErr.Code)
+	_, err = c.handleStmtReset([]byte{1, 0, 0, 0})
+	require.NoError(t, err)
+
+	// Dropped with the statement by COM_STMT_CLOSE.
+	c.dispatch(longDataPacket(0, "abc"))
+	require.NoError(t, c.handleStmtClose([]byte{1, 0, 0, 0}))
+	require.Equal(t, 0, h.reserved)
+
+	// Dropped by ResetStmts.
+	prepare()
+	c.dispatch(append([]byte{mysql.COM_STMT_SEND_LONG_DATA, 2, 0, 0, 0, 0, 0}, "abc"...))
+	require.Equal(t, 3, h.reserved)
+	require.NoError(t, c.ResetStmts())
+	require.Equal(t, 0, h.reserved)
+}

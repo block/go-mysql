@@ -36,6 +36,28 @@ type Stmt struct {
 	// COM_STMT_EXECUTE packet. Cleared after every execution and by
 	// COM_STMT_RESET.
 	longData [][]byte
+	// longDataSize is the total of longData, reserved through the handler's
+	// LongDataHandler when it has one.
+	longDataSize int
+	// longDataErr is the statement's error state: set when long data is
+	// refused, returned by every COM_STMT_EXECUTE, cleared only by
+	// COM_STMT_RESET, as in MySQL.
+	longDataErr error
+}
+
+// LongDataHandler is implemented by a Handler that accounts for the memory
+// COM_STMT_SEND_LONG_DATA retains, for instance against a bound shared by
+// every connection. ReserveLongData is called before n more bytes are
+// retained; an error refuses them and puts the statement in the error state
+// SetMaxLongDataSize describes, with that error. ReleaseLongData returns
+// bytes when they are discarded: consumed by an execution, cleared by
+// COM_STMT_RESET, refused, or dropped with the statement by COM_STMT_CLOSE
+// or Conn.ResetStmts. Long data still retained when the connection ends is
+// not released; the handler releases what it holds when it is done with the
+// connection.
+type LongDataHandler interface {
+	ReserveLongData(n int) error
+	ReleaseLongData(n int)
 }
 
 func (s *Stmt) Rest(params int, columns int, context any) {
@@ -45,9 +67,35 @@ func (s *Stmt) Rest(params int, columns int, context any) {
 	s.ResetParams()
 }
 
+// ResetParams clears the bound values and long data. It does not release
+// long data reserved through a LongDataHandler; the server's own resets do.
 func (s *Stmt) ResetParams() {
 	s.Args = make([]any, s.Params)
 	s.longData = nil
+	s.longDataSize = 0
+}
+
+// resetStmtParams is ResetParams, releasing the statement's long data to the
+// handler's LongDataHandler.
+func (c *Conn) resetStmtParams(s *Stmt) {
+	if h, ok := c.h.(LongDataHandler); ok && s.longDataSize > 0 {
+		h.ReleaseLongData(s.longDataSize)
+	}
+	s.ResetParams()
+}
+
+// maxLongDataSize is the per-parameter long data bound.
+func (c *Conn) maxLongDataSize() int {
+	if c.serverConf == nil || c.serverConf.maxLongDataSize <= 0 {
+		return DefaultMaxLongDataSize
+	}
+	return c.serverConf.maxLongDataSize
+}
+
+// errLongDataTooLong is MySQL's answer to long data past max_allowed_packet.
+func errLongDataTooLong() error {
+	return mysql.NewError(mysql.ER_UNKNOWN_ERROR,
+		"Parameter of prepared statement which is set through mysql_send_long_data() is longer than 'max_allowed_packet' bytes")
 }
 
 func (c *Conn) writePrepare(s *Stmt) error {
@@ -136,7 +184,11 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	// Long data and bound values are consumed by this execution whatever its
 	// outcome, including a rejected flag, as in MySQL; the bound types
 	// persist.
-	defer s.ResetParams()
+	defer c.resetStmtParams(s)
+
+	if s.longDataErr != nil {
+		return nil, s.longDataErr
+	}
 
 	flag := data[pos]
 	pos++
@@ -388,18 +440,42 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 		return nil
 	}
 
+	// A statement in the error state ignores long data until
+	// COM_STMT_RESET.
+	if s.longDataErr != nil {
+		return nil
+	}
+
 	if s.longData == nil {
 		s.longData = make([][]byte, s.Params)
+	}
+	chunk := data[6:]
+	if len(s.longData[paramID])+len(chunk) > c.maxLongDataSize() {
+		c.failLongData(s, errLongDataTooLong())
+		return nil
+	}
+	if h, ok := c.h.(LongDataHandler); ok {
+		if err := h.ReserveLongData(len(chunk)); err != nil {
+			c.failLongData(s, err)
+			return nil
+		}
 	}
 	// append copies defensively: the value outlives this packet, which
 	// belongs to the caller. A non-nil empty slice still marks the parameter
 	// as sent through long data.
 	if s.longData[paramID] == nil {
-		s.longData[paramID] = make([]byte, 0, len(data)-6)
+		s.longData[paramID] = make([]byte, 0, len(chunk))
 	}
-	s.longData[paramID] = append(s.longData[paramID], data[6:]...)
+	s.longData[paramID] = append(s.longData[paramID], chunk...)
+	s.longDataSize += len(chunk)
 
 	return nil
+}
+
+// failLongData puts s in the error state with err, discarding its long data.
+func (c *Conn) failLongData(s *Stmt, err error) {
+	c.resetStmtParams(s)
+	s.longDataErr = err
 }
 
 func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
@@ -415,7 +491,8 @@ func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
 			strconv.FormatUint(uint64(id), 10), "stmt_reset")
 	}
 
-	s.ResetParams()
+	c.resetStmtParams(s)
+	s.longDataErr = nil
 
 	return mysql.NewResultReserveResultset(0), nil
 }
@@ -437,6 +514,7 @@ func (c *Conn) handleStmtClose(data []byte) error {
 		return err
 	}
 
+	c.resetStmtParams(stmt)
 	delete(c.stmts, id)
 
 	return nil
@@ -454,6 +532,7 @@ func (c *Conn) ResetStmts() error {
 		if err := c.h.HandleStmtClose(st.Context); err != nil {
 			errs = append(errs, err)
 		}
+		c.resetStmtParams(st)
 		delete(c.stmts, id)
 	}
 	return stderrors.Join(errs...)
