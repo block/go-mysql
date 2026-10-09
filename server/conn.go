@@ -109,14 +109,7 @@ func (c *Conn) handshake() error {
 	}
 
 	if err := c.readHandshakeResponse(); err != nil {
-		if errors.Is(err, ErrAccessDenied) {
-			var usingPasswd uint16 = mysql.ER_YES
-			if errors.Is(err, ErrAccessDeniedNoPassword) {
-				usingPasswd = mysql.ER_NO
-			}
-			err = mysql.NewDefaultError(mysql.ER_ACCESS_DENIED_ERROR, c.user,
-				c.RemoteAddr().String(), mysql.MySQLErrName[usingPasswd])
-		}
+		err = c.accessDeniedError(err)
 		c.authHandler.OnAuthFailure(c, err)
 		_ = c.writeError(err)
 		return err
@@ -134,6 +127,20 @@ func (c *Conn) handshake() error {
 	c.ResetSequence()
 
 	return nil
+}
+
+// accessDeniedError turns ErrAccessDenied into the ER_ACCESS_DENIED_ERROR a
+// client is sent; other errors are returned unchanged.
+func (c *Conn) accessDeniedError(err error) error {
+	if !errors.Is(err, ErrAccessDenied) {
+		return err
+	}
+	var usingPasswd uint16 = mysql.ER_YES
+	if errors.Is(err, ErrAccessDeniedNoPassword) {
+		usingPasswd = mysql.ER_NO
+	}
+	return mysql.NewDefaultError(mysql.ER_ACCESS_DENIED_ERROR, c.user,
+		c.RemoteAddr().String(), mysql.MySQLErrName[usingPasswd])
 }
 
 func (c *Conn) Close() {
