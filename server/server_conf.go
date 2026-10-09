@@ -45,7 +45,13 @@ type Server struct {
 	tlsConfig         *tls.Config
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
+	maxLongDataSize   int64 // read and written atomically
 }
+
+// DefaultMaxLongDataSize is the default bound on one prepared-statement
+// parameter's COM_STMT_SEND_LONG_DATA bytes: MySQL's default
+// max_allowed_packet, the bound MySQL applies.
+const DefaultMaxLongDataSize = 64 << 20
 
 // NewDefaultServer: New mysql server with default settings.
 //
@@ -73,6 +79,7 @@ func NewDefaultServer() *Server {
 		tlsConfig:         tlsConf,
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      &DefaultAuthenticationProvider{},
+		maxLongDataSize:   DefaultMaxLongDataSize,
 	}
 }
 
@@ -127,11 +134,33 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 		tlsConfig:         tlsConfig,
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      authProvider,
+		maxLongDataSize:   DefaultMaxLongDataSize,
 	}
 }
 
 func isAuthMethodSupported(authMethod string) bool {
 	return authMethod == mysql.AUTH_NATIVE_PASSWORD || authMethod == mysql.AUTH_CACHING_SHA2_PASSWORD || authMethod == mysql.AUTH_SHA256_PASSWORD || authMethod == mysql.AUTH_CLEAR_PASSWORD
+}
+
+// SetMaxLongDataSize sets how many bytes COM_STMT_SEND_LONG_DATA may
+// accumulate for one parameter of a prepared statement, MySQL's
+// max_allowed_packet check. A chunk that would take a parameter past it puts
+// the statement in an error state, as in MySQL: its long data is discarded,
+// later chunks are ignored, and every COM_STMT_EXECUTE fails with
+// ER_UNKNOWN_ERROR until COM_STMT_RESET. n <= 0 restores
+// DefaultMaxLongDataSize. It is safe to call while serving: a new bound
+// applies to the chunks that arrive after it.
+func (s *Server) SetMaxLongDataSize(n int) {
+	if n <= 0 {
+		n = DefaultMaxLongDataSize
+	}
+	atomic.StoreInt64(&s.maxLongDataSize, int64(n))
+}
+
+// MaxLongDataSize returns the per-parameter long data bound (see
+// SetMaxLongDataSize).
+func (s *Server) MaxLongDataSize() int {
+	return int(atomic.LoadInt64(&s.maxLongDataSize))
 }
 
 func (s *Server) InvalidateCache(username string, host string) {

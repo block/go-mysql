@@ -36,6 +36,15 @@ type Conn struct {
 	stmtID uint32
 
 	closed atomic.Bool
+
+	// longDataMu guards longDataHeld and longDataReleased, which Close
+	// reads from whatever goroutine calls it. longDataHeld is what this
+	// connection holds reserved through a LongDataHandler; Close returns it
+	// all and sets longDataReleased, after which nothing more is reserved
+	// and later releases are no-ops.
+	longDataMu       sync.Mutex
+	longDataHeld     int
+	longDataReleased bool
 }
 
 var (
@@ -144,8 +153,12 @@ func (c *Conn) accessDeniedError(err error) error {
 		c.RemoteAddr().String(), mysql.MySQLErrName[usingPasswd])
 }
 
+// Close closes the connection and releases, through the handler's
+// LongDataHandler, all long data its statements still hold. It may be called
+// from any goroutine, including while a command is being handled.
 func (c *Conn) Close() {
 	c.closed.Store(true)
+	c.releaseAllLongData()
 	c.Conn.Close()
 }
 

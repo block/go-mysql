@@ -2,9 +2,15 @@ package server
 
 import (
 	stderrors "errors"
+	"net"
 	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
 	"github.com/go-mysql-org/go-mysql/stmt"
@@ -438,4 +444,291 @@ func TestResetStmtsReportsCloseErrors(t *testing.T) {
 	require.ErrorIs(t, err, closeErr)
 	require.ElementsMatch(t, []any{1, 2}, h.closed)
 	require.Empty(t, c.stmts, "statements are deallocated even when a close fails")
+}
+
+func TestStmtCloseDeallocatesWhenTheHandlerFails(t *testing.T) {
+	closeErr := stderrors.New("close failed")
+	h := &accountingStmtHandler{recordingStmtHandler: recordingStmtHandler{params: 1, closeErr: closeErr}, limit: 6}
+	c := newStmtTestConn(h)
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+	c.dispatch(longDataPacket(0, "abc"))
+	require.Equal(t, 3, h.reserved)
+
+	require.ErrorIs(t, c.handleStmtClose([]byte{1, 0, 0, 0}), closeErr)
+	require.Empty(t, c.stmts, "the statement is deallocated even when its close fails")
+	require.Equal(t, 0, h.reserved, "its long data is released")
+}
+
+// longDataPacket is a COM_STMT_SEND_LONG_DATA for statement 1.
+func longDataPacket(param byte, chunk string) []byte {
+	return append([]byte{mysql.COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, param, 0}, chunk...)
+}
+
+func TestStmtLongDataLimit(t *testing.T) {
+	h := &recordingStmtHandler{params: 2}
+	c := newStmtTestConn(h)
+	c.serverConf = &Server{maxLongDataSize: 4}
+	c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "INSERT INTO t VALUES (?, ?)"...))
+	types := []byte{mysql.MYSQL_TYPE_BLOB, 0, mysql.MYSQL_TYPE_BLOB, 0}
+
+	// The bound is per parameter and inclusive: 4 bytes in each is accepted.
+	c.dispatch(longDataPacket(0, "ab"))
+	c.dispatch(longDataPacket(0, "cd"))
+	c.dispatch(longDataPacket(1, "efgh"))
+	_, err := c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+	require.NoError(t, err)
+
+	// One byte past it puts the statement in the error state.
+	c.dispatch(longDataPacket(0, "abc"))
+	c.dispatch(longDataPacket(0, "de"))
+	tooLong := "Parameter of prepared statement which is set through mysql_send_long_data() is longer than 'max_allowed_packet' bytes"
+	for range 2 {
+		_, err = c.handleStmtExecute(executePacket([]byte{0}, types, []byte{1, 'x', 1, 'y'}))
+		var myErr *mysql.MyError
+		require.ErrorAs(t, err, &myErr)
+		require.Equal(t, uint16(mysql.ER_UNKNOWN_ERROR), myErr.Code)
+		require.Equal(t, "HY000", myErr.State)
+		require.Equal(t, tooLong, myErr.Message)
+	}
+	// Long data is ignored in the error state, and the refused bytes are
+	// not kept.
+	c.dispatch(longDataPacket(1, "z"))
+	require.Nil(t, c.stmts[1].longData)
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+	require.ErrorContains(t, err, tooLong)
+
+	// COM_STMT_RESET clears it.
+	_, err = c.handleStmtReset([]byte{1, 0, 0, 0})
+	require.NoError(t, err)
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, []byte{1, 'x', 1, 'y'}))
+	require.NoError(t, err)
+
+	require.Equal(t, [][]any{
+		{mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("abcd")}, mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("efgh")}},
+		{mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("x")}, mysql.TypedBytes{Type: mysql.MYSQL_TYPE_BLOB, Bytes: []byte("y")}},
+	}, h.args)
+}
+
+func TestSetMaxLongDataSize(t *testing.T) {
+	s := &Server{}
+	s.SetMaxLongDataSize(10)
+	require.Equal(t, 10, s.MaxLongDataSize())
+	s.SetMaxLongDataSize(0)
+	require.Equal(t, DefaultMaxLongDataSize, s.MaxLongDataSize())
+	// A connection without a server configuration has the default bound.
+	require.Equal(t, DefaultMaxLongDataSize, newStmtTestConn(&recordingStmtHandler{}).maxLongDataSize())
+}
+
+// TestSetMaxLongDataSizeWhileServing changes the bound while a connection
+// reads it; run with -race.
+func TestSetMaxLongDataSizeWhileServing(t *testing.T) {
+	s := &Server{}
+	c := newStmtTestConn(&recordingStmtHandler{})
+	c.serverConf = s
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 1; i <= 1000; i++ {
+			s.SetMaxLongDataSize(i)
+		}
+	}()
+	for range 1000 {
+		require.Positive(t, c.maxLongDataSize())
+	}
+	<-done
+	require.Equal(t, 1000, c.maxLongDataSize())
+}
+
+// accountingStmtHandler records long data reservations and refuses those
+// that would take the total past limit.
+type accountingStmtHandler struct {
+	recordingStmtHandler
+	limit    int
+	reserved int
+}
+
+func (h *accountingStmtHandler) ReserveLongData(n int) error {
+	if h.reserved+n > h.limit {
+		return mysql.NewDefaultError(mysql.ER_OUT_OF_RESOURCES)
+	}
+	h.reserved += n
+	return nil
+}
+
+func (h *accountingStmtHandler) ReleaseLongData(n int) {
+	h.reserved -= n
+}
+
+func TestStmtLongDataHandler(t *testing.T) {
+	h := &accountingStmtHandler{recordingStmtHandler: recordingStmtHandler{params: 1}, limit: 6}
+	c := newStmtTestConn(h)
+	prepare := func() {
+		c.dispatch(append([]byte{mysql.COM_STMT_PREPARE}, "SELECT ?"...))
+	}
+	types := []byte{mysql.MYSQL_TYPE_BLOB, 0}
+	prepare()
+
+	// Consumed by an execution.
+	for _, chunk := range []string{"abc", "a"} {
+		c.dispatch(longDataPacket(0, chunk))
+		require.Equal(t, len(chunk), h.reserved)
+		_, err := c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+		require.NoError(t, err)
+		require.Equal(t, 0, h.reserved)
+	}
+
+	// Cleared by COM_STMT_RESET.
+	c.dispatch(longDataPacket(0, "abc"))
+	_, err := c.handleStmtReset([]byte{1, 0, 0, 0})
+	require.NoError(t, err)
+	require.Equal(t, 0, h.reserved)
+
+	// Refused: the handler's error is the statement's error state, and what
+	// was reserved before is released.
+	c.dispatch(longDataPacket(0, "abcd"))
+	c.dispatch(longDataPacket(0, "efg"))
+	require.Equal(t, 0, h.reserved)
+	_, err = c.handleStmtExecute(executePacket([]byte{0}, types, nil))
+	var myErr *mysql.MyError
+	require.ErrorAs(t, err, &myErr)
+	require.Equal(t, uint16(mysql.ER_OUT_OF_RESOURCES), myErr.Code)
+	_, err = c.handleStmtReset([]byte{1, 0, 0, 0})
+	require.NoError(t, err)
+
+	// Dropped with the statement by COM_STMT_CLOSE.
+	c.dispatch(longDataPacket(0, "abc"))
+	require.NoError(t, c.handleStmtClose([]byte{1, 0, 0, 0}))
+	require.Equal(t, 0, h.reserved)
+
+	// Dropped by ResetStmts.
+	prepare()
+	c.dispatch(append([]byte{mysql.COM_STMT_SEND_LONG_DATA, 2, 0, 0, 0, 0, 0}, "abc"...))
+	require.Equal(t, 3, h.reserved)
+	require.NoError(t, c.ResetStmts())
+	require.Equal(t, 0, h.reserved)
+}
+
+// sharedQuotaHandler is one handler shared by every connection, accounting
+// long data against a single quota, the use case LongDataHandler documents.
+type sharedQuotaHandler struct {
+	EmptyHandler
+	mu       sync.Mutex
+	limit    int
+	reserved int
+}
+
+func (h *sharedQuotaHandler) HandleStmtPrepare(string) (int, int, any, error) {
+	return 1, 0, nil, nil
+}
+
+func (h *sharedQuotaHandler) HandleStmtClose(any) error { return nil }
+
+func (h *sharedQuotaHandler) ReserveLongData(n int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.reserved+n > h.limit {
+		return mysql.NewDefaultError(mysql.ER_OUT_OF_RESOURCES)
+	}
+	h.reserved += n
+	return nil
+}
+
+func (h *sharedQuotaHandler) ReleaseLongData(n int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.reserved -= n
+}
+
+func (h *sharedQuotaHandler) held() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reserved
+}
+
+// TestLongDataReleasedOnTeardown buffers long data against a shared quota,
+// ends the connection without executing, resetting or closing the
+// statement, and checks a new connection can use the whole quota: after the
+// client disconnects (a read error), after COM_QUIT, and after the server
+// calls Conn.Close between commands, with no HandleCommand after it.
+func TestLongDataReleasedOnTeardown(t *testing.T) {
+	const quota = 6
+	for _, teardown := range []string{"client disconnects", "client quits", "server closes"} {
+		t.Run(teardown, func(t *testing.T) {
+			h := &sharedQuotaHandler{limit: quota}
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			serverConns := make(chan *Conn, 2)
+			// closeAfterCommand makes the first connection's command loop
+			// call Close after the next command and stop.
+			var closeAfterCommand atomic.Bool
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for i := range 2 {
+					conn, err := l.Accept()
+					if err != nil {
+						return
+					}
+					auth := NewInMemoryAuthenticationHandler()
+					if err := auth.AddUser("u1", "p1"); err != nil {
+						return
+					}
+					co, err := NewDefaultServer().NewCustomizedConn(conn, auth, h)
+					if err != nil {
+						return
+					}
+					serverConns <- co
+					go func() {
+						for co.HandleCommand() == nil {
+							if i == 0 && closeAfterCommand.Load() {
+								co.Close()
+								return
+							}
+						}
+					}()
+				}
+			}()
+			t.Cleanup(func() {
+				l.Close()
+				<-done
+			})
+
+			// fill prepares a statement and buffers quota bytes of long data.
+			fill := func() *client.Conn {
+				c, err := client.Connect(l.Addr().String(), "u1", "p1", "")
+				require.NoError(t, err)
+				stmt, err := c.Prepare("SELECT ?")
+				require.NoError(t, err)
+				c.ResetSequence()
+				pkt := append([]byte{0, 0, 0, 0, mysql.COM_STMT_SEND_LONG_DATA}, mysql.Uint32ToBytes(stmt.ID)...)
+				pkt = append(pkt, 0, 0)
+				pkt = append(pkt, strings.Repeat("x", quota)...)
+				require.NoError(t, c.WritePacket(pkt))
+				// COM_STMT_SEND_LONG_DATA has no response; a ping's answer
+				// means it has been handled.
+				require.NoError(t, c.Ping())
+				return c
+			}
+
+			first := fill()
+			<-serverConns
+			require.Equal(t, quota, h.held())
+			switch teardown {
+			case "client disconnects":
+				require.NoError(t, first.Close())
+			case "client quits":
+				require.NoError(t, first.Quit())
+			case "server closes":
+				closeAfterCommand.Store(true)
+				require.NoError(t, first.Ping())
+				t.Cleanup(func() { first.Close() })
+			}
+			require.Eventually(t, func() bool { return h.held() == 0 }, 5*time.Second, time.Millisecond)
+
+			second := fill()
+			t.Cleanup(func() { second.Close() })
+			<-serverConns
+			require.Equal(t, quota, h.held(), "the new connection has the whole quota")
+		})
+	}
 }
