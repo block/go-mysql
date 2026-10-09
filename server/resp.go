@@ -36,9 +36,11 @@ func (c *Conn) writeOK(r *mysql.Result) error {
 }
 
 func (c *Conn) writeError(e error) error {
+	// errors.As, not a type assertion: handler errors reach here wrapped
+	// (handleStmtExecute traces them), and a wrapped *MyError must keep its
+	// code and SQLSTATE rather than degrade to ER_UNKNOWN_ERROR.
 	var m *mysql.MyError
-	var ok bool
-	if m, ok = e.(*mysql.MyError); !ok {
+	if !errors.As(e, &m) {
 		m = mysql.NewError(mysql.ER_UNKNOWN_ERROR, e.Error())
 	}
 
