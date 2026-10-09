@@ -126,11 +126,11 @@ func (s *clientTestSuite) TestConn_ChangeUser() {
 	isNull, _ = r.GetInt(0, 0)
 	require.Equal(s.T(), int64(1), isNull)
 
-	// A failed change closes the connection.
+	// A failed change reports the server's error. Whether the connection
+	// survives is the server's choice: MySQL closes it, MariaDB does not.
 	err = c.ChangeUser(*testUser, *testPassword+"-wrong", *testDB)
 	require.ErrorAs(s.T(), err, &myErr)
 	require.Equal(s.T(), uint16(mysql.ER_ACCESS_DENIED_ERROR), myErr.Code)
-	require.Error(s.T(), c.Ping())
 }
 
 func (s *clientTestSuite) TestConn_Compress() {

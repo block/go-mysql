@@ -300,8 +300,8 @@ func (c *Conn) UseDBWithResult(dbName string) (*mysql.Result, error) {
 // an open transaction, deallocates prepared statements and clears session
 // variables), and selects dbName, or no database when dbName is "".
 //
-// MySQL closes the connection when the change fails, so the Conn is not
-// usable after an error.
+// MySQL closes the connection when the change fails (MariaDB keeps it open),
+// so do not rely on the Conn after an error.
 func (c *Conn) ChangeUser(user, password, dbName string) error {
 	c.user, c.password = user, password
 	auth, addNull, err := c.genAuthResponse(c.salt)
