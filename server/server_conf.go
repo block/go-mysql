@@ -46,7 +46,8 @@ type Server struct {
 	tlsConfig         *tls.Config
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
-	maxLongDataSize   int64 // read and written atomically
+	maxLongDataSize   int64         // read and written atomically
+	initialStatus     atomic.Uint32 // SERVER_STATUS_* flags of a new connection (see SetInitialStatus)
 }
 
 // DefaultMaxLongDataSize is the default bound on one prepared-statement
@@ -162,6 +163,38 @@ func (s *Server) SetMaxLongDataSize(n int) {
 // SetMaxLongDataSize).
 func (s *Server) MaxLongDataSize() int {
 	return int(atomic.LoadInt64(&s.maxLongDataSize))
+}
+
+// userConfigurableInitialStatus are the SERVER_STATUS_* flags SetInitialStatus
+// accepts: the ones that describe a session's state before it runs anything.
+const userConfigurableInitialStatus = mysql.SERVER_STATUS_AUTOCOMMIT | mysql.SERVER_STATUS_NO_BACKSLASH_ESCAPED
+
+// SetInitialStatus sets the SERVER_STATUS_* flags a new connection starts
+// with: the status its initial handshake packet reports, and the status every
+// OK and EOF packet carries until the Handler changes it with
+// (*Conn).SetStatus and (*Conn).UnsetStatus.
+//
+// MySQL starts a session with SERVER_STATUS_AUTOCOMMIT, since autocommit is on
+// by default. A Handler that reports its session state has to set the initial
+// state here rather than on the Conn: the handshake packet, and the OK that
+// ends authentication, are written before NewCustomizedConn returns the Conn.
+//
+// The default is no flags. Only SERVER_STATUS_AUTOCOMMIT and
+// SERVER_STATUS_NO_BACKSLASH_ESCAPED may be set; the other flags describe a
+// transaction or a statement, which a new connection does not have. It is safe
+// to call while serving: it applies to connections created after it.
+func (s *Server) SetInitialStatus(status uint16) error {
+	if invalid := status &^ userConfigurableInitialStatus; invalid != 0 {
+		return fmt.Errorf("initial status %#x contains flags %#x that do not describe a new session; only SERVER_STATUS_AUTOCOMMIT and SERVER_STATUS_NO_BACKSLASH_ESCAPED are supported", status, invalid)
+	}
+	s.initialStatus.Store(uint32(status))
+	return nil
+}
+
+// InitialStatus returns the SERVER_STATUS_* flags a new connection starts with
+// (see SetInitialStatus).
+func (s *Server) InitialStatus() uint16 {
+	return uint16(s.initialStatus.Load())
 }
 
 func (s *Server) InvalidateCache(username string, host string) {
