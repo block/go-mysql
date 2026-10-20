@@ -385,7 +385,9 @@ type (
 var errStreamAnswered = errors.New("streamed resultset failed; its error ended the response")
 
 // writeMoreResult writes r as a result another result follows: the packet that
-// ends it carries SERVER_MORE_RESULTS_EXISTS.
+// ends it carries SERVER_MORE_RESULTS_EXISTS. It flushes r, as MySQL sends each
+// result when its statement ends: otherwise r would wait in the write buffer
+// while the next statement runs, however long that takes.
 func (c *Conn) writeMoreResult(r *mysql.Result) error {
 	had := c.status & mysql.SERVER_MORE_RESULTS_EXISTS
 	c.status |= mysql.SERVER_MORE_RESULTS_EXISTS
@@ -401,6 +403,9 @@ func (c *Conn) writeMoreResult(r *mysql.Result) error {
 	}
 	if stream != nil && stream.Err() != nil {
 		return errStreamAnswered
+	}
+	if c.Conn != nil {
+		return c.Flush()
 	}
 	return nil
 }

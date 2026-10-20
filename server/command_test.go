@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -39,6 +40,10 @@ type multiResultHandler struct {
 	mu       sync.Mutex
 	executed []string
 	moreErr  error
+
+	// delivered is closed by a client that has read an earlier result;
+	// the "await" statement waits for it.
+	delivered chan struct{}
 }
 
 func (h *multiResultHandler) HandleQuery(query string) (*mysql.Result, error) {
@@ -85,6 +90,13 @@ func (h *multiResultHandler) execute(statement string) (*mysql.Result, error) {
 			return nil, err
 		}
 		return mysql.NewResult(rs), nil
+	case "await":
+		select {
+		case <-h.delivered:
+			return &mysql.Result{}, nil
+		case <-time.After(5 * time.Second):
+			return nil, mysql.NewError(mysql.ER_QUERY_INTERRUPTED, "earlier result not delivered")
+		}
 	case "stream":
 		sr := mysql.NewStreamResult(makeFields("a"), 1, false)
 		go func() {
@@ -197,6 +209,24 @@ func TestMultiResultHandlerAnswersEachStatement(t *testing.T) {
 	r, err := c.Execute("ok")
 	require.NoError(t, err)
 	require.Zero(t, r.Status&mysql.SERVER_MORE_RESULTS_EXISTS)
+}
+
+// An earlier result reaches the client before the next statement finishes,
+// as on MySQL: a slow statement must not hold the results before it in the
+// write buffer.
+func TestMultiResultHandlerDeliversEachResultBeforeTheNext(t *testing.T) {
+	c, h := serveMultiResult(t)
+	h.delivered = make(chan struct{})
+
+	var results int
+	_, err := c.ExecuteMultiple("ok;await", func(r *mysql.Result, err error) {
+		require.NoError(t, err)
+		if results++; results == 1 {
+			close(h.delivered)
+		}
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, results)
 }
 
 func TestMultiResultHandlerStopsAtFirstError(t *testing.T) {
