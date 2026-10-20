@@ -374,12 +374,55 @@ func (c *Conn) writeBinlogEvents(s *replication.BinlogStreamer) error {
 type (
 	noResponse  struct{}
 	eofResponse struct{}
+	// writeFailed ends a command whose response could not be written
+	// completely: nothing more is written, and HandleCommand returns err.
+	writeFailed struct{ err error }
 )
+
+// errStreamAnswered reports that a streamed resultset passed to a
+// MultiResultHandler's more failed after its rows began, and that the error
+// packet answering it has ended the response.
+var errStreamAnswered = errors.New("streamed resultset failed; its error ended the response")
+
+// writeMoreResult writes r as a result another result follows: the packet that
+// ends it carries SERVER_MORE_RESULTS_EXISTS. It flushes r, as MySQL sends each
+// result when its statement ends: otherwise r would wait in the write buffer
+// while the next statement runs, however long that takes.
+func (c *Conn) writeMoreResult(r *mysql.Result) error {
+	if r != nil {
+		// writeOK merges the connection status into the Result it writes;
+		// a copy keeps SERVER_MORE_RESULTS_EXISTS off the Handler's Result,
+		// which it may pass on again, as the last result for one.
+		copied := *r
+		r = &copied
+	}
+	had := c.status & mysql.SERVER_MORE_RESULTS_EXISTS
+	c.status |= mysql.SERVER_MORE_RESULTS_EXISTS
+	defer func() {
+		c.status = c.status&^mysql.SERVER_MORE_RESULTS_EXISTS | had
+	}()
+	var stream *mysql.StreamResult
+	if r.IsStreaming() {
+		stream = r.StreamResult
+	}
+	if err := c.WriteValue(r); err != nil {
+		return err
+	}
+	if stream != nil && stream.Err() != nil {
+		return errStreamAnswered
+	}
+	if c.Conn != nil {
+		return c.Flush()
+	}
+	return nil
+}
 
 func (c *Conn) WriteValue(value any) error {
 	switch v := value.(type) {
 	case noResponse:
 		return nil
+	case writeFailed:
+		return v.err
 	case eofResponse:
 		return c.writeEOFOrOK()
 	case error:
