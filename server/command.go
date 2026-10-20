@@ -52,9 +52,14 @@ type MultiResultHandler interface {
 	// response, as HandleQuery would. A HandleMultiQuery that never calls
 	// more answers exactly as HandleQuery does.
 	//
-	// The status flags and warning count a result is written with are read
-	// when more is called, so a Handler that tracks them with SetStatus and
-	// SetWarnings updates them for each result before passing it on.
+	// A result is written when more is called, with the status flags and
+	// warning count in effect then, so a Handler updates them for each
+	// result before passing it on. The two kinds of result take their
+	// warning count from different places: an OK result (no resultset)
+	// writes its own Result.Warnings, while a resultset's terminating
+	// EOF/OK packet writes the connection's count, set with SetWarnings.
+	// The status flags set with SetStatus apply to both. more does not
+	// modify the Result passed to it.
 	//
 	// When more returns an error the response has ended: the result could
 	// not be written, or it was a streamed resultset that failed and has

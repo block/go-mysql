@@ -44,6 +44,8 @@ type multiResultHandler struct {
 	// delivered is closed by a client that has read an earlier result;
 	// the "await" statement waits for it.
 	delivered chan struct{}
+	// shared, when set, is the one Result every "ok" statement returns.
+	shared *mysql.Result
 }
 
 func (h *multiResultHandler) HandleQuery(query string) (*mysql.Result, error) {
@@ -80,6 +82,9 @@ func (h *multiResultHandler) HandleMultiQuery(query string, more func(*mysql.Res
 func (h *multiResultHandler) execute(statement string) (*mysql.Result, error) {
 	switch statement {
 	case "ok":
+		if h.shared != nil {
+			return h.shared, nil
+		}
 		return &mysql.Result{AffectedRows: 1}, nil
 	case "rows", "warn":
 		if statement == "warn" {
@@ -227,6 +232,56 @@ func TestMultiResultHandlerDeliversEachResultBeforeTheNext(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 2, results)
+}
+
+// A Handler may pass the same Result to more and then return it: the
+// temporary SERVER_MORE_RESULTS_EXISTS must not stay on it, or the last
+// result would announce another and the client would wait for it forever.
+func TestMultiResultHandlerReusedResult(t *testing.T) {
+	c, h := serveMultiResult(t)
+	h.shared = &mysql.Result{AffectedRows: 1}
+
+	type outcome struct {
+		response multiResponse
+		err      error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var o outcome
+		_, o.err = c.ExecuteMultiple("ok;ok", func(r *mysql.Result, err error) {
+			if err != nil {
+				o.response.err = err
+				return
+			}
+			o.response.results = append(o.response.results, r)
+		})
+		done <- o
+	}()
+	var o outcome
+	select {
+	case o = <-done:
+	case <-time.After(5 * time.Second):
+		c.Close() // unblocks the read
+		t.Fatal("the last result announced another result")
+	}
+	require.NoError(t, o.err)
+	require.NoError(t, o.response.err)
+	require.Len(t, o.response.results, 2)
+	require.NotZero(t, o.response.results[0].Status&mysql.SERVER_MORE_RESULTS_EXISTS)
+	require.Zero(t, o.response.results[1].Status&mysql.SERVER_MORE_RESULTS_EXISTS)
+	require.Zero(t, h.shared.Status&mysql.SERVER_MORE_RESULTS_EXISTS)
+}
+
+// OK results carry their own warning count; resultset terminators carry the
+// connection's.
+func TestWriteMoreResultWarningSources(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{Conn: packet.NewConn(clientConn), serverConf: &Server{capability: mysql.CLIENT_PROTOCOL_41}, capability: mysql.CLIENT_PROTOCOL_41}
+	conn.SetWarnings(2)
+	require.NoError(t, conn.writeMoreResult(&mysql.Result{AffectedRows: 1, Warnings: 3}))
+	ok := clientConn.WriteBuffered
+	// header(4) OK(1) affected(1) insert id(1) status(2) warnings(2)
+	require.Equal(t, []byte{3, 0}, ok[len(ok)-2:])
 }
 
 func TestMultiResultHandlerStopsAtFirstError(t *testing.T) {

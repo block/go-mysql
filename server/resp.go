@@ -389,6 +389,13 @@ var errStreamAnswered = errors.New("streamed resultset failed; its error ended t
 // result when its statement ends: otherwise r would wait in the write buffer
 // while the next statement runs, however long that takes.
 func (c *Conn) writeMoreResult(r *mysql.Result) error {
+	if r != nil {
+		// writeOK merges the connection status into the Result it writes;
+		// a copy keeps SERVER_MORE_RESULTS_EXISTS off the Handler's Result,
+		// which it may pass on again, as the last result for one.
+		copied := *r
+		r = &copied
+	}
 	had := c.status & mysql.SERVER_MORE_RESULTS_EXISTS
 	c.status |= mysql.SERVER_MORE_RESULTS_EXISTS
 	defer func() {
