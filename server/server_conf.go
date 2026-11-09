@@ -204,13 +204,20 @@ func (s *Server) InitialStatus() uint16 {
 // A cursor keeps the Handler's complete Resultset on the connection until
 // COM_STMT_FETCH drains it, or the statement is executed again, reset or
 // closed, so a Handler that bounds the memory of the results it builds per
-// command cannot account for it. With cursors disabled, such an execution is
-// answered with its rows inline and without SERVER_STATUS_CURSOR_EXISTS:
-// what MySQL does when it does not open a cursor, and what clients that ask
-// for one (libmysqlclient, Connector/J with useCursorFetch) already handle by
-// reading the rows from the execute response. A later COM_STMT_FETCH fails
-// with ER_STMT_HAS_NO_OPEN_CURSOR. It is safe to call while serving: it
-// applies to executions that start after it.
+// command cannot account for it. Such a Handler must call
+// SetCursorsEnabled(false), before the Server accepts connections.
+//
+// With cursors disabled, such an execution is answered with its rows inline
+// and without SERVER_STATUS_CURSOR_EXISTS: what MySQL does when it does not
+// open a cursor, and what clients that ask for one (libmysqlclient,
+// Connector/J with useCursorFetch) already handle by reading the rows from
+// the execute response. A later COM_STMT_FETCH fails with
+// ER_STMT_HAS_NO_OPEN_CURSOR.
+//
+// It is safe to call while serving, but it applies only to executions that
+// start after it. A cursor that is already open stays fetchable, and keeps
+// its Resultset, until it is drained, or its statement is executed again,
+// reset or closed.
 func (s *Server) SetCursorsEnabled(enabled bool) {
 	s.cursorsDisabled.Store(!enabled)
 }

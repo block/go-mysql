@@ -1149,6 +1149,84 @@ func TestStmtCursorDisabled(t *testing.T) {
 	}
 }
 
+// newCursorTestConn returns a connection with statement 1 prepared, serving
+// cursorStmtHandler's three rows.
+func newCursorTestConn() (*Conn, *mockconn.MockConn, *Stmt) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	c := &Conn{
+		Conn:       packet.NewConn(clientConn),
+		serverConf: &Server{},
+		capability: mysql.CLIENT_PROTOCOL_41,
+		h:          &cursorStmtHandler{},
+		stmts:      make(map[uint32]*Stmt),
+	}
+	st := &Stmt{}
+	st.Rest(0, 2, nil)
+	c.stmts[1] = st
+	return c, clientConn, st
+}
+
+// Cursors are enabled on a new Server, and on a Conn that has no Server.
+func TestStmtCursorsEnabledByDefault(t *testing.T) {
+	require.True(t, (&Server{}).CursorsEnabled())
+	require.True(t, (&Conn{}).cursorsEnabled())
+}
+
+// Disabling cursors affects only executions that start after it: a cursor
+// opened before stays fetchable until the statement is executed again.
+func TestStmtCursorOpenedBeforeDisable(t *testing.T) {
+	c, clientConn, st := newCursorTestConn()
+	run := func(data ...byte) [][]byte {
+		t.Helper()
+		clientConn.WriteBuffered = nil
+		require.NoError(t, c.WriteValue(c.dispatch(data)))
+		return splitPackets(t, clientConn.WriteBuffered)
+	}
+	execute := []byte{mysql.COM_STMT_EXECUTE, 1, 0, 0, 0, mysql.CURSOR_TYPE_READ_ONLY, 1, 0, 0, 0}
+	fetchOne := []byte{mysql.COM_STMT_FETCH, 1, 0, 0, 0, 1, 0, 0, 0}
+
+	run(execute...)
+	require.NotNil(t, st.cursor)
+
+	c.serverConf.SetCursorsEnabled(false)
+	// One row and the EOF: the earlier cursor is still served.
+	require.Len(t, run(fetchOne...), 2)
+	require.NotNil(t, st.cursor)
+
+	// Executing again answers inline and drops the cursor.
+	run(execute...)
+	require.Nil(t, st.cursor)
+	packets := run(fetchOne...)
+	require.Len(t, packets, 1)
+	require.Equal(t, mysql.ERR_HEADER, packets[0][0])
+
+	c.serverConf.SetCursorsEnabled(true)
+	run(execute...)
+	require.NotNil(t, st.cursor)
+}
+
+// SetCursorsEnabled may be called while executions are served. Meaningful
+// under -race.
+func TestStmtSetCursorsEnabledConcurrently(t *testing.T) {
+	c, clientConn, _ := newCursorTestConn()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := range 1000 {
+			c.serverConf.SetCursorsEnabled(i%2 == 0)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			clientConn.WriteBuffered = nil
+			_ = c.WriteValue(c.dispatch([]byte{mysql.COM_STMT_EXECUTE, 1, 0, 0, 0, mysql.CURSOR_TYPE_READ_ONLY, 1, 0, 0, 0}))
+		}
+	}()
+	wg.Wait()
+}
+
 type noResultStmtHandler struct {
 	EmptyHandler
 }
