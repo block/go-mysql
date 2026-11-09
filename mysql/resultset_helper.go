@@ -41,6 +41,9 @@ func FormatTextValue(value any) ([]byte, error) {
 	case []byte:
 		return v, nil
 	case string:
+		if v == "" {
+			return []byte{}, nil
+		}
 		return utils.StringToByteSlice(v), nil
 	case time.Time:
 		return utils.StringToByteSlice(v.Format(time.DateTime)), nil
@@ -729,6 +732,9 @@ func formatField(field *Field, value any) error {
 
 func BuildSimpleTextResultset(names []string, values [][]any) (*Resultset, error) {
 	r := NewResultset(len(names))
+	// A pooled Resultset keeps the previous result's *Field pointers, and the
+	// loop below only creates a Field for a nil slot.
+	clear(r.Fields)
 
 	var b []byte
 
@@ -793,6 +799,13 @@ func BuildSimpleTextResultset(names []string, values [][]any) (*Resultset, error
 func BuildSimpleBinaryResultset(names []string, values [][]any) (*Resultset, error) {
 	r := NewResultset(len(names))
 
+	if len(values) == 0 {
+		for i, name := range names {
+			r.Fields[i] = &Field{Name: utils.StringToByteSlice(name), Charset: 33, Type: MYSQL_TYPE_NULL}
+		}
+		return r, nil
+	}
+
 	var b []byte
 
 	bitmapLen := (len(names) + 7 + 2) >> 3
@@ -820,6 +833,16 @@ func BuildSimpleBinaryResultset(names []string, values [][]any) (*Resultset, err
 
 				if err = formatField(field, value); err != nil {
 					return nil, errors.Trace(err)
+				}
+			} else if typ != r.Fields[j].Type {
+				oldIsNull, newIsNull := r.Fields[j].Type == MYSQL_TYPE_NULL, typ == MYSQL_TYPE_NULL
+				if oldIsNull && !newIsNull {
+					r.Fields[j].Type = typ
+					if err = formatField(r.Fields[j], value); err != nil {
+						return nil, errors.Trace(err)
+					}
+				} else if !oldIsNull && !newIsNull {
+					return nil, errors.Errorf("row types aren't consistent")
 				}
 			}
 			if value == nil {
