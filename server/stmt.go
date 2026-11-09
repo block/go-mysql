@@ -153,6 +153,12 @@ func (c *Conn) maxLongDataSize() int {
 	return c.serverConf.MaxLongDataSize()
 }
 
+// cursorsEnabled reports whether a CURSOR_TYPE_READ_ONLY execution opens a
+// cursor (see Server.SetCursorsEnabled).
+func (c *Conn) cursorsEnabled() bool {
+	return c.serverConf == nil || c.serverConf.CursorsEnabled()
+}
+
 // errLongDataTooLong is MySQL's answer to long data past max_allowed_packet.
 func errLongDataTooLong() error {
 	return mysql.NewError(mysql.ER_UNKNOWN_ERROR,
@@ -315,8 +321,9 @@ func (c *Conn) handleStmtExecute(data []byte) (any, error) {
 		return nil, errors.Trace(err)
 	}
 
-	// A streaming result can't be buffered, so it keeps being sent inline.
-	if flag&mysql.CURSOR_TYPE_READ_ONLY == 0 || r == nil || !r.HasResultset() || r.IsStreaming() {
+	// A streaming result can't be buffered, so it keeps being sent inline, as
+	// is every result when cursors are disabled.
+	if flag&mysql.CURSOR_TYPE_READ_ONLY == 0 || !c.cursorsEnabled() || r == nil || !r.HasResultset() || r.IsStreaming() {
 		return r, nil
 	}
 

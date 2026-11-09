@@ -48,6 +48,7 @@ type Server struct {
 	authProvider      AuthenticationProvider
 	maxLongDataSize   int64         // read and written atomically
 	initialStatus     atomic.Uint32 // SERVER_STATUS_* flags of a new connection (see SetInitialStatus)
+	cursorsDisabled   atomic.Bool   // see SetCursorsEnabled
 }
 
 // DefaultMaxLongDataSize is the default bound on one prepared-statement
@@ -195,6 +196,29 @@ func (s *Server) SetInitialStatus(status uint16) error {
 // (see SetInitialStatus).
 func (s *Server) InitialStatus() uint16 {
 	return uint16(s.initialStatus.Load())
+}
+
+// SetCursorsEnabled sets whether a COM_STMT_EXECUTE asking for
+// CURSOR_TYPE_READ_ONLY opens a cursor. The default is enabled.
+//
+// A cursor keeps the Handler's complete Resultset on the connection until
+// COM_STMT_FETCH drains it, or the statement is executed again, reset or
+// closed, so a Handler that bounds the memory of the results it builds per
+// command cannot account for it. With cursors disabled, such an execution is
+// answered with its rows inline and without SERVER_STATUS_CURSOR_EXISTS:
+// what MySQL does when it does not open a cursor, and what clients that ask
+// for one (libmysqlclient, Connector/J with useCursorFetch) already handle by
+// reading the rows from the execute response. A later COM_STMT_FETCH fails
+// with ER_STMT_HAS_NO_OPEN_CURSOR. It is safe to call while serving: it
+// applies to executions that start after it.
+func (s *Server) SetCursorsEnabled(enabled bool) {
+	s.cursorsDisabled.Store(!enabled)
+}
+
+// CursorsEnabled reports whether a CURSOR_TYPE_READ_ONLY execution opens a
+// cursor (see SetCursorsEnabled).
+func (s *Server) CursorsEnabled() bool {
+	return !s.cursorsDisabled.Load()
 }
 
 func (s *Server) InvalidateCache(username string, host string) {

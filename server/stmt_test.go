@@ -1102,6 +1102,53 @@ func TestStmtCursor(t *testing.T) {
 	}
 }
 
+// With cursors disabled, CURSOR_TYPE_READ_ONLY is answered like
+// CURSOR_TYPE_NO_CURSOR: the rows inline, no SERVER_STATUS_CURSOR_EXISTS, and
+// nothing kept on the statement.
+func TestStmtCursorDisabled(t *testing.T) {
+	for _, deprecateEOF := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deprecateEOF=%t", deprecateEOF), func(t *testing.T) {
+			h := &cursorStmtHandler{}
+			clientConn := &mockconn.MockConn{MultiWrite: true}
+			c := &Conn{
+				Conn:       packet.NewConn(clientConn),
+				serverConf: &Server{},
+				capability: mysql.CLIENT_PROTOCOL_41,
+				h:          h,
+				stmts:      make(map[uint32]*Stmt),
+			}
+			require.True(t, c.serverConf.CursorsEnabled())
+			c.serverConf.SetCursorsEnabled(false)
+			require.False(t, c.serverConf.CursorsEnabled())
+			if deprecateEOF {
+				c.SetCapability(mysql.CLIENT_DEPRECATE_EOF)
+				require.NoError(t, c.serverConf.SetCapability(mysql.CLIENT_DEPRECATE_EOF))
+			}
+			st := &Stmt{}
+			st.Rest(0, 2, nil)
+			c.stmts[1] = st
+
+			require.NoError(t, c.WriteValue(c.dispatch([]byte{mysql.COM_STMT_EXECUTE, 1, 0, 0, 0, mysql.CURSOR_TYPE_READ_ONLY, 1, 0, 0, 0})))
+			packets := splitPackets(t, clientConn.WriteBuffered)
+
+			// Column count, two definitions, the EOF after them unless
+			// deprecated, three rows, and the terminator.
+			want := 1 + 2 + 3 + 1
+			if !deprecateEOF {
+				want++
+			}
+			require.Len(t, packets, want)
+			require.Equal(t, []byte{2}, packets[0])
+			require.Zero(t, statusOf(t, packets[len(packets)-1])&mysql.SERVER_STATUS_CURSOR_EXISTS)
+			require.False(t, c.HasStatus(mysql.SERVER_STATUS_CURSOR_EXISTS))
+			require.Nil(t, st.cursor)
+
+			_, err := c.handleStmtFetch([]byte{1, 0, 0, 0, 1, 0, 0, 0})
+			require.ErrorContains(t, err, "has no open cursor")
+		})
+	}
+}
+
 type noResultStmtHandler struct {
 	EmptyHandler
 }
