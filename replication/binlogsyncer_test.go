@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
+	"github.com/go-mysql-org/go-mysql/test_util"
 )
 
 func TestLocalHostname(t *testing.T) {
@@ -204,4 +207,129 @@ func TestBinlogSyncerConfigLogsAsJSON(t *testing.T) {
 	require.NotContains(t, buf.String(), "hunter2")
 	require.Contains(t, buf.String(), `"ServerID":100`)
 	require.Contains(t, buf.String(), `"Port":3306`)
+}
+
+// killTestSyncer returns a syncer configured for the test server, a
+// connection to that server, and the server's identity. It skips the test when
+// there is no test server.
+func killTestSyncer(t *testing.T) (*BinlogSyncer, *client.Conn, serverIdentity) {
+	t.Helper()
+	flavor := mysql.MySQLFlavor
+	if test_util.ServerFlavor != "" {
+		flavor = test_util.ServerFlavor
+	}
+	port, err := strconv.ParseUint(*test_util.MysqlPort, 10, 16)
+	require.NoError(t, err)
+
+	conn, err := client.Connect(killTestAddr(), "root", "", "")
+	if err != nil {
+		t.Skip(err.Error())
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	b := NewBinlogSyncer(BinlogSyncerConfig{
+		ServerID: 100,
+		Flavor:   flavor,
+		Host:     *test_util.MysqlHost,
+		Port:     uint16(port),
+		User:     "root",
+	})
+	identity, err := b.readServerIdentity(conn)
+	require.NoError(t, err)
+	require.NotEmpty(t, identity.id)
+	require.NotEmpty(t, identity.hostname)
+	return b, conn, identity
+}
+
+func killTestAddr() string {
+	return fmt.Sprintf("%s:%s", *test_util.MysqlHost, *test_util.MysqlPort)
+}
+
+// newVictim opens a connection that stands in for the last dump connection,
+// and returns a function that reports whether it is still alive.
+func newVictim(t *testing.T) (*client.Conn, func() bool) {
+	t.Helper()
+	victim, err := client.Connect(killTestAddr(), "root", "", "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = victim.Close() })
+	return victim, func() bool {
+		_, err := victim.Execute("SELECT 1")
+		return err == nil
+	}
+}
+
+// TestKillLastConnectionChecksServer pins that the last connection is killed
+// only over a connection to the server it was on. The same connection ID on
+// any other server is an unrelated session.
+func TestKillLastConnectionChecksServer(t *testing.T) {
+	b, conn, same := killTestSyncer(t)
+	defer b.Close()
+
+	for _, tc := range []struct {
+		name       string
+		identity   *serverIdentity
+		wantKilled bool
+	}{
+		{name: "same server", identity: &same, wantKilled: true},
+		{name: "same server_uuid, another host", identity: &serverIdentity{id: same.id, hostname: same.hostname + "-other"}},
+		{name: "another server_uuid", identity: &serverIdentity{id: same.id + "-other", hostname: same.hostname}},
+		{name: "unknown server"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			victim, alive := newVictim(t)
+			b.lastConnectionID = victim.GetConnectionID()
+			b.lastServerIdentity = tc.identity
+			b.killLastConnection(conn)
+			if tc.wantKilled {
+				require.Eventually(t, func() bool { return !alive() }, 5*time.Second, 10*time.Millisecond)
+			} else {
+				require.True(t, alive())
+			}
+		})
+	}
+	b.lastConnectionID = 0
+}
+
+// TestCloseKillsOnlyOnTheSameServer pins that Close, which dials a new
+// connection to kill the last one, checks the server it reached.
+func TestCloseKillsOnlyOnTheSameServer(t *testing.T) {
+	for _, sameServer := range []bool{true, false} {
+		t.Run(fmt.Sprintf("same server %v", sameServer), func(t *testing.T) {
+			b, _, identity := killTestSyncer(t)
+			if !sameServer {
+				identity.hostname += "-other"
+			}
+			victim, alive := newVictim(t)
+			b.lastConnectionID = victim.GetConnectionID()
+			b.lastServerIdentity = &identity
+			b.Close()
+			if sameServer {
+				require.Eventually(t, func() bool { return !alive() }, 5*time.Second, 10*time.Millisecond)
+			} else {
+				require.True(t, alive())
+			}
+		})
+	}
+}
+
+// TestRegisterSlaveRecordsServer pins that registering checks the server
+// before killing the connection it replaces, and records the server the new
+// connection is on.
+func TestRegisterSlaveRecordsServer(t *testing.T) {
+	b, _, identity := killTestSyncer(t)
+	defer b.Close()
+
+	victim, alive := newVictim(t)
+	b.lastConnectionID = victim.GetConnectionID()
+	b.lastServerIdentity = &serverIdentity{id: identity.id, hostname: identity.hostname + "-other"}
+
+	b.m.Lock()
+	err := b.registerSlave()
+	b.m.Unlock()
+	require.NoError(t, err)
+
+	require.True(t, alive(), "the connection was on another server")
+	require.Equal(t, b.c.GetConnectionID(), b.lastConnectionID)
+	require.NotNil(t, b.lastServerIdentity)
+	require.Equal(t, identity, *b.lastServerIdentity)
 }

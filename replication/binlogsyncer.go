@@ -216,7 +216,26 @@ type BinlogSyncer struct {
 
 	lastConnectionID uint32
 
+	// lastServerIdentity is the server lastConnectionID is on, or nil when it
+	// could not be read. See killLastConnection.
+	lastServerIdentity *serverIdentity
+
 	retryCount int
+}
+
+// serverIdentity is which server a connection is on.
+//
+// A connection ID is only unique on its own server, and the connection that
+// kills the last dump connection is dialed anew, to an address that can by
+// then resolve to a different server: a cluster endpoint after a failover,
+// say. The same ID there is an unrelated session.
+type serverIdentity struct {
+	// id is @@server_uuid, or @@server_id on MariaDB, which has no
+	// server_uuid.
+	id string
+	// hostname tells apart servers that share a server_uuid, such as the
+	// instances of an Aurora cluster.
+	hostname string
 }
 
 // NewBinlogSyncer creates the BinlogSyncer with the given configuration.
@@ -303,7 +322,7 @@ func (b *BinlogSyncer) close() {
 		// doesn't actually disconnect it.
 		c, err := b.newConnection(context.Background())
 		if err == nil {
-			b.killConnection(c, b.lastConnectionID)
+			b.killLastConnection(c)
 			c.Close()
 		}
 	}
@@ -361,12 +380,17 @@ func (b *BinlogSyncer) registerSlave() error {
 	}
 
 	// kill last connection id
-	if b.lastConnectionID > 0 {
-		b.killConnection(b.c, b.lastConnectionID)
-	}
+	b.killLastConnection(b.c)
 
-	// save last last connection id for kill
+	// save last last connection id for kill, and the server it is on
 	b.lastConnectionID = b.c.GetConnectionID()
+	b.lastServerIdentity = nil
+	if identity, err := b.readServerIdentity(b.c); err != nil {
+		b.cfg.Logger.Warn("could not read the server's identity; this connection will not be killed when it is replaced or closed",
+			slog.Any("error", err), slog.Int64("id", int64(b.lastConnectionID)))
+	} else {
+		b.lastServerIdentity = &identity
+	}
 
 	// for mysql 5.6+, binlog has a crc32 checksum
 	// before mysql 5.6, this will not work, don't matter.:-)
@@ -1131,6 +1155,53 @@ func (b *BinlogSyncer) newConnection(ctx context.Context) (*client.Conn, error) 
 			}
 			return nil
 		})
+}
+
+// readServerIdentity reads which server conn is on.
+func (b *BinlogSyncer) readServerIdentity(conn *client.Conn) (serverIdentity, error) {
+	query := "SELECT @@server_uuid, @@hostname"
+	if b.cfg.Flavor == mysql.MariaDBFlavor {
+		query = "SELECT @@server_id, @@hostname"
+	}
+	r, err := conn.Execute(query)
+	if err != nil {
+		return serverIdentity{}, errors.Trace(err)
+	}
+	id, err := r.GetString(0, 0)
+	if err != nil {
+		return serverIdentity{}, errors.Trace(err)
+	}
+	hostname, err := r.GetString(0, 1)
+	if err != nil {
+		return serverIdentity{}, errors.Trace(err)
+	}
+	return serverIdentity{id: id, hostname: hostname}, nil
+}
+
+// killLastConnection kills the last dump connection, b.lastConnectionID, over
+// conn — but only when conn is on the same server, since the same ID on
+// another server is an unrelated session (see serverIdentity). When either
+// server is unknown nothing is killed: the old connection's socket is closed
+// regardless, and the server ends its dump thread when it next writes to it.
+func (b *BinlogSyncer) killLastConnection(conn *client.Conn) {
+	if b.lastConnectionID == 0 {
+		return
+	}
+	id := slog.Int64("id", int64(b.lastConnectionID))
+	if b.lastServerIdentity == nil {
+		b.cfg.Logger.Warn("not killing last connection: the server it was on is unknown", id)
+		return
+	}
+	identity, err := b.readServerIdentity(conn)
+	if err != nil {
+		b.cfg.Logger.Warn("not killing last connection: could not read the server's identity", id, slog.Any("error", err))
+		return
+	}
+	if identity != *b.lastServerIdentity {
+		b.cfg.Logger.Info("not killing last connection: it was on a different server", id)
+		return
+	}
+	b.killConnection(conn, b.lastConnectionID)
 }
 
 func (b *BinlogSyncer) killConnection(conn *client.Conn, id uint32) {
